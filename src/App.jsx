@@ -1,18 +1,47 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowsLeftRight, Check, DownloadSimple, GearSix, List, Pause, Play,
   SkipBack, SkipForward, SpeakerSimpleHigh, Stop,
   Waveform as WaveformIcon, Wrench,
 } from '@phosphor-icons/react'
+import {
+  analyzeBrowserFiles,
+  analyzeNativePaths,
+  browseNativeAudioFiles,
+  formatDuration,
+  isTauriRuntime,
+  listenForNativeDrop,
+} from './lib/audioFiles.js'
+import { demoTracks } from './data/demoTracks.js'
 
-const seedTracks = [
-  { id: 1, name: 'Song01_Vocal.wav', duration: '03:42', state: 'ready', progress: 100 },
-  { id: 2, name: 'Song01_Drums.wav', duration: '03:42', state: 'done', progress: 100 },
-  { id: 3, name: 'Song01_Bass.wav', duration: '03:42', state: 'done', progress: 100 },
-  { id: 4, name: 'Song01_Guitars.wav', duration: '03:42', state: 'done', progress: 100 },
-  { id: 5, name: 'Song01_Keys.wav', duration: '03:42', state: 'working', progress: 68 },
-  { id: 6, name: 'Song01_Other.wav', duration: '03:42', state: 'queued', progress: 12 },
-]
+function compactSampleRate(value) {
+  if (!value) return '—'
+  const kiloHertz = value / 1000
+  return `${Number.isInteger(kiloHertz) ? kiloHertz : kiloHertz.toFixed(1)} kHz`
+}
+
+function trackFromMetadata(metadata, index, now) {
+  const rawLayout = metadata.channelLayout || `${metadata.channels || 0} channels`
+  return {
+    id: `${now}-${index}-${metadata.path ?? metadata.name}`,
+    name: metadata.name,
+    path: metadata.path,
+    duration: formatDuration(metadata.durationSeconds),
+    durationSeconds: metadata.durationSeconds,
+    state: 'ready',
+    progress: 100,
+    container: metadata.container || 'UNKNOWN',
+    codec: metadata.codec || 'Unknown codec',
+    sampleRateHz: metadata.sampleRate || 0,
+    bitDepth: metadata.bitDepth,
+    channels: metadata.channels || 0,
+    channelLayout: `${rawLayout.charAt(0).toUpperCase()}${rawLayout.slice(1)}`,
+    fileSize: metadata.fileSize || 0,
+    metadataSource: metadata.source,
+    truePeak: null,
+    lufs: null,
+  }
+}
 
 function seededAmplitude(index, channel) {
   const pulse = Math.abs(Math.sin(index * 0.109 + channel * 0.8))
@@ -112,7 +141,7 @@ function TrackRow({ track, index, selected, onSelect }) {
       <Play className="track-play" weight="fill" />
       <span className="track-main">
         <span className="track-name">{track.name}</span>
-        <span className="track-meta">WAV&nbsp;&nbsp; 48 kHz&nbsp;&nbsp; 24-bit&nbsp;&nbsp; •&nbsp;&nbsp; {track.duration}</span>
+        <span className="track-meta">{track.container}&nbsp;&nbsp; {compactSampleRate(track.sampleRateHz)}&nbsp;&nbsp; {track.bitDepth ? `${track.bitDepth}-bit` : '—'}&nbsp;&nbsp; •&nbsp;&nbsp; {track.duration}</span>
         <span className="track-progress"><i style={{ width: `${track.progress}%` }} /></span>
       </span>
       <span className={`track-state ${track.state}`}>{statusIcon || `${track.progress}%`}</span>
@@ -121,7 +150,7 @@ function TrackRow({ track, index, selected, onSelect }) {
 }
 
 export function App() {
-  const [tracks, setTracks] = useState(seedTracks)
+  const [tracks, setTracks] = useState(demoTracks)
   const [selectedId, setSelectedId] = useState(1)
   const [mono, setMono] = useState(false)
   const [normalize, setNormalize] = useState(false)
@@ -132,6 +161,7 @@ export function App() {
   const [abMode, setAbMode] = useState('A')
   const [position, setPosition] = useState(0.012)
   const [processing, setProcessing] = useState(false)
+  const [importing, setImporting] = useState(false)
   const [notice, setNotice] = useState('')
   const fileInput = useRef(null)
   const selected = useMemo(() => tracks.find((track) => track.id === selectedId) ?? tracks[0], [tracks, selectedId])
@@ -148,15 +178,73 @@ export function App() {
     return () => window.clearTimeout(timer)
   }, [notice])
 
-  const addFiles = (fileList) => {
-    const audioFiles = [...fileList].filter((file) => file.type.startsWith('audio/') || /\.(wav|flac|mp3|aiff?)$/i.test(file.name))
-    if (!audioFiles.length) { setNotice('No supported audio files found'); return }
+  useEffect(() => {
+    document.querySelector('.track-row.selected')?.scrollIntoView({ block: 'nearest' })
+  }, [selectedId, tracks.length])
+
+  const appendMetadata = useCallback(({ metadata, errors }) => {
+    if (!metadata.length) {
+      setNotice(errors[0] || 'No supported audio files found')
+      return
+    }
     const now = Date.now()
-    const added = audioFiles.map((file, index) => ({ id: now + index, name: file.name, duration: '--:--', state: 'queued', progress: 0 }))
+    const added = metadata.map((item, index) => trackFromMetadata(item, index, now))
     setTracks((current) => [...current, ...added])
     setSelectedId(added[0].id)
-    setNotice(`${added.length} track${added.length > 1 ? 's' : ''} added`)
-  }
+    setNotice(errors.length ? `${added.length} added · ${errors.length} failed` : `${added.length} track${added.length > 1 ? 's' : ''} analyzed`)
+  }, [])
+
+  const addFiles = useCallback(async (fileList) => {
+    if (!fileList?.length || importing) return
+    setImporting(true)
+    setNotice(`Analyzing ${fileList.length} track${fileList.length > 1 ? 's' : ''}…`)
+    try {
+      appendMetadata(await analyzeBrowserFiles(fileList))
+    } catch (error) {
+      setNotice(error.message || 'Audio analysis failed')
+    } finally {
+      setImporting(false)
+    }
+  }, [appendMetadata, importing])
+
+  const addNativePaths = useCallback(async (paths) => {
+    if (!paths?.length || importing) return
+    setImporting(true)
+    setNotice(`Reading ${paths.length} track${paths.length > 1 ? 's' : ''} with FFprobe…`)
+    try {
+      appendMetadata(await analyzeNativePaths(paths))
+    } catch (error) {
+      setNotice(error.message || 'FFprobe analysis failed')
+    } finally {
+      setImporting(false)
+    }
+  }, [appendMetadata, importing])
+
+  const browseForTracks = useCallback(async () => {
+    if (!isTauriRuntime()) {
+      fileInput.current?.click()
+      return
+    }
+    try {
+      const paths = await browseNativeAudioFiles()
+      await addNativePaths(paths)
+    } catch (error) {
+      setNotice(error.message || 'Unable to open audio files')
+    }
+  }, [addNativePaths])
+
+  useEffect(() => {
+    let unlisten = () => {}
+    let mounted = true
+    listenForNativeDrop(addNativePaths).then((cleanup) => {
+      if (mounted) unlisten = cleanup
+      else cleanup()
+    }).catch((error) => setNotice(error.message || 'Native drop listener failed'))
+    return () => {
+      mounted = false
+      unlisten()
+    }
+  }, [addNativePaths])
 
   const processSelected = () => {
     if (processing) return
@@ -170,12 +258,12 @@ export function App() {
   }
 
   return (
-    <main className="app-shell" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files) }}>
-      <input ref={fileInput} className="visually-hidden" type="file" multiple accept="audio/*,.wav,.flac,.aif,.aiff" onChange={(event) => addFiles(event.target.files)} />
+    <main className={`app-shell ${importing ? 'is-importing' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files) }}>
+      <input ref={fileInput} className="visually-hidden" type="file" multiple accept="audio/*,.wav,.wave,.flac,.mp3,.m4a,.aac,.ogg,.opus,.aif,.aiff" onChange={(event) => { addFiles(event.target.files); event.target.value = '' }} />
       <header className="brandbar"><strong>NAS <em>VocRep</em></strong></header>
 
       <aside className="queue-panel">
-        <div className="queue-heading"><span>TRACK QUEUE</span><span>{tracks.length} / {tracks.length}</span><button type="button" aria-label="Queue menu" onClick={() => fileInput.current?.click()}><List size={24} /></button></div>
+        <div className="queue-heading"><span>TRACK QUEUE</span><span>{tracks.length} / {tracks.length}</span><button type="button" aria-label="Import tracks" onClick={browseForTracks} disabled={importing}><List size={24} /></button></div>
         <div className="track-list">{tracks.map((track, index) => <TrackRow key={track.id} track={track} index={index} selected={track.id === selectedId} onSelect={() => setSelectedId(track.id)} />)}</div>
       </aside>
 
@@ -206,11 +294,11 @@ export function App() {
         </div>
 
         <div className="facts-row">
-          <div><span>FORMAT</span><strong>WAV</strong></div><div><span>SAMPLE RATE</span><strong>{sampleRate}</strong></div><div><span>BIT DEPTH</span><strong>24-bit</strong></div><div><span>CHANNELS</span><strong>{mono ? 'Mono' : 'Stereo'}</strong></div><div><span>TRUE PEAK</span><strong className="peak">-2.3 dBTP</strong></div><div><span>INTEGRATED LUFS</span><strong className="lufs">-17.8 LUFS</strong></div>
+          <div><span>FORMAT</span><strong title={selected.codec}>{selected.container}</strong></div><div><span>SAMPLE RATE</span><strong>{compactSampleRate(selected.sampleRateHz)}</strong></div><div><span>BIT DEPTH</span><strong>{selected.bitDepth ? `${selected.bitDepth}-bit` : '—'}</strong></div><div><span>CHANNELS</span><strong>{selected.channelLayout}</strong></div><div><span>TRUE PEAK</span><strong className={selected.truePeak ? 'peak' : ''}>{selected.truePeak ?? 'Pending'}</strong></div><div><span>INTEGRATED LUFS</span><strong className={selected.lufs ? 'lufs' : ''}>{selected.lufs ?? 'Pending'}</strong></div>
         </div>
 
         <div className="analysis-row">
-          <div className="analysis-title"><i /> ESTIMATED ANALYSIS</div><div><span>NOISE FLOOR (RMS)</span><strong>-72.1 dB</strong></div><div><span>DYNAMIC RANGE</span><strong>13.6 dB</strong></div><div><span>PEAK LEVEL</span><strong>-2.3 dBTP</strong></div><div><span>LOUDNESS RANGE</span><strong>7.2 LU</strong></div><div><span>CREST FACTOR</span><strong>11.5 dB</strong></div><div><span>CLIPPING</span><strong>0 samples</strong></div>
+          <div className="analysis-title"><i /> ESTIMATED ANALYSIS</div><div><span>NOISE FLOOR (RMS)</span><strong>{selected.truePeak ? '-72.1 dB' : '—'}</strong></div><div><span>DYNAMIC RANGE</span><strong>{selected.truePeak ? '13.6 dB' : '—'}</strong></div><div><span>PEAK LEVEL</span><strong>{selected.truePeak ?? '—'}</strong></div><div><span>LOUDNESS RANGE</span><strong>{selected.lufs ? '7.2 LU' : '—'}</strong></div><div><span>CREST FACTOR</span><strong>{selected.truePeak ? '11.5 dB' : '—'}</strong></div><div><span>CLIPPING</span><strong>{selected.truePeak ? '0 samples' : '—'}</strong></div>
         </div>
       </section>
 

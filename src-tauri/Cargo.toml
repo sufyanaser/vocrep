@@ -1,0 +1,20 @@
+[package]
+name = "vocrep"
+version = "0.1.0"
+description = "Suno track preparation for Cubase"
+authors = ["NAS CodeWorks"]
+edition = "2021"
+
+[lib]
+name = "vocrep_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+
