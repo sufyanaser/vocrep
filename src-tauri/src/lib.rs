@@ -56,7 +56,7 @@ fn check_audio_engine() -> AudioEngineStatus {
     };
     let required = ["adeclick", "afftdn", "loudnorm"];
     let missing_filters = required.iter()
-        .filter(|name| !filters.contains(**name))
+        .filter(|name| !filters.contains(*name))
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
     AudioEngineStatus {
