@@ -247,36 +247,45 @@ export function App() {
     }
   }, [addNativePaths])
 
-  const processSelected = async () => {
+  const processTracks = async (targets) => {
     if (processing) return
-    if (!selected?.path) {
-      setNotice('Import a local track to process it')
+    const nativeTargets = targets.filter((track) => track.path)
+    if (!nativeTargets.length) {
+      setNotice('Import local tracks to process them')
       return
     }
+    const targetIds = new Set(nativeTargets.map((track) => track.id))
     setProcessing(true)
-    setTracks((current) => current.map((track) => track.id === selectedId ? { ...track, state: 'working', progress: 32 } : track))
+    setTracks((current) => current.map((track) => targetIds.has(track.id) ? { ...track, state: 'working', progress: 32 } : track))
     try {
-      const result = await processNativeAudio([selected.path], {
+      const result = await processNativeAudio(nativeTargets.map((track) => track.path), {
         mono,
         normalize,
         sampleRate: sampleRate === '44.1 kHz' ? 44100 : 48000,
       })
-      if (!result.completed.length) throw new Error(result.errors[0] || 'Processing failed')
-      const outputPath = result.completed[0].outputPath
-      setTracks((current) => current.map((track) => track.id === selectedId ? {
-        ...track,
-        state: 'done',
-        progress: 100,
-        outputPath,
-      } : track))
-      setNotice('Saved to CUBASE_READY')
+      const outputs = new Map(result.completed.map((item) => [item.inputPath, item.outputPath]))
+      setTracks((current) => current.map((track) => {
+        if (!targetIds.has(track.id)) return track
+        const outputPath = outputs.get(track.path)
+        return outputPath
+          ? { ...track, state: 'done', progress: 100, outputPath }
+          : { ...track, state: 'error', progress: 0 }
+      }))
+      if (result.errors.length) {
+        setNotice(`${result.completed.length} exported · ${result.errors.length} failed`)
+      } else {
+        setNotice(`${result.completed.length} track${result.completed.length > 1 ? 's' : ''} saved to CUBASE_READY`)
+      }
     } catch (error) {
-      setTracks((current) => current.map((track) => track.id === selectedId ? { ...track, state: 'ready', progress: 100 } : track))
-      setNotice(error.message || 'Processing failed')
+      setTracks((current) => current.map((track) => targetIds.has(track.id) ? { ...track, state: 'ready', progress: 100 } : track))
+      setNotice(error.message || 'Batch processing failed')
     } finally {
       setProcessing(false)
     }
   }
+
+  const processSelected = () => processTracks(selected ? [selected] : [])
+  const exportAll = () => processTracks(tracks)
 
   return (
     <main className={`app-shell ${importing ? 'is-importing' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files) }}>
@@ -326,7 +335,7 @@ export function App() {
       <footer className="actionbar">
         <div className="project-info"><GearSix size={28} /><span>Project: <strong>Song01</strong></span><span>Date: 2026-07-11</span></div>
         <button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={processSelected}><WaveformIcon weight="bold" />{processing ? 'PROCESSING…' : 'PROCESS SELECTED'}</button>
-        <button className="export-button" type="button" onClick={() => setNotice(selected.outputPath ? 'Saved in CUBASE_READY' : 'Process the selected track first')}><DownloadSimple /> EXPORT FOR CUBASE</button>
+        <button className="export-button" type="button" onClick={exportAll} disabled={processing}><DownloadSimple /> {processing ? 'EXPORTING…' : 'EXPORT ALL FOR CUBASE'}</button>
       </footer>
       {notice && <div className="notice" role="status">{notice}</div>}
     </main>
