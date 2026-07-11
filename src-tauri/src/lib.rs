@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::Path, process::Command};
+use std::{fs, path::{Path, PathBuf}, process::Command};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -104,11 +104,81 @@ fn probe_audio_files(paths: Vec<String>) -> Vec<Result<AudioMetadata, String>> {
     paths.into_iter().map(|path| probe_audio_path(&path)).collect()
 }
 
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessOptions {
+    pub mono: bool,
+    pub normalize: bool,
+    pub sample_rate: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessResult {
+    pub input_path: String,
+    pub output_path: String,
+}
+
+fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, String> {
+    let parent = input.parent().ok_or_else(|| "Input file has no parent folder".to_string())?;
+    let output_dir = parent.join("CUBASE_READY");
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("Unable to create CUBASE_READY: {error}"))?;
+    let stem = input.file_stem().and_then(|value| value.to_str()).unwrap_or("track");
+    let channel = if options.mono { "_Mono" } else { "" };
+    let rate = if options.sample_rate == 44_100 { "_44k" } else { "_48k" };
+    Ok(output_dir.join(format!("{stem}_Ready{channel}{rate}.wav")))
+}
+
+fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessResult, String> {
+    if options.sample_rate != 44_100 && options.sample_rate != 48_000 {
+        return Err("Sample rate must be 44100 or 48000".to_string());
+    }
+    let input = Path::new(path);
+    if !input.is_file() {
+        return Err(format!("Audio file not found: {path}"));
+    }
+    let output_path = output_path_for(input, options)?;
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "error", "-y", "-i", path, "-vn"]);
+    if options.mono {
+        command.args(["-ac", "1"]);
+    }
+    if options.normalize {
+        command.args(["-af", "loudnorm=I=-18:TP=-1.0:LRA=11"]);
+    }
+    command.args([
+        "-ar",
+        &options.sample_rate.to_string(),
+        "-c:a",
+        "pcm_s24le",
+        output_path.to_string_lossy().as_ref(),
+    ]);
+    let result = command.output().map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
+    if !result.status.success() {
+        let message = String::from_utf8_lossy(&result.stderr).trim().to_string();
+        return Err(if message.is_empty() { "FFmpeg processing failed".to_string() } else { message });
+    }
+    Ok(ProcessResult {
+        input_path: path.to_string(),
+        output_path: output_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn process_audio_files(
+    paths: Vec<String>,
+    options: ProcessOptions,
+) -> Vec<Result<ProcessResult, String>> {
+    paths.into_iter().map(|path| process_audio_path(&path, &options)).collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![probe_audio_files])
+        .invoke_handler(tauri::generate_handler![probe_audio_files, process_audio_files])
         .run(tauri::generate_context!())
         .expect("error while running NAS VocRep");
 }
@@ -116,6 +186,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creates_cubase_ready_output_name() {
+        let options = ProcessOptions { mono: true, normalize: true, sample_rate: 48_000 };
+        let output = output_path_for(Path::new("/tmp/Song01 Vocal.wav"), &options).unwrap();
+        assert!(output.ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k.wav"));
+    }
 
     #[test]
     fn parses_pcm_wave_metadata() {
