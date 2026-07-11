@@ -14,7 +14,6 @@ import {
   listenForNativeDrop,
   processNativeAudio,
 } from './lib/audioFiles.js'
-import { demoTracks } from './data/demoTracks.js'
 
 function compactSampleRate(value) {
   if (!value) return '—'
@@ -152,8 +151,8 @@ function TrackRow({ track, index, selected, onSelect }) {
 }
 
 export function App() {
-  const [tracks, setTracks] = useState(demoTracks)
-  const [selectedId, setSelectedId] = useState(1)
+  const [tracks, setTracks] = useState([])
+  const [selectedId, setSelectedId] = useState(null)
   const [mono, setMono] = useState(false)
   const [normalize, setNormalize] = useState(false)
   const [repair, setRepair] = useState(true)
@@ -167,7 +166,10 @@ export function App() {
   const [notice, setNotice] = useState('')
   const [engineStatus, setEngineStatus] = useState({ ready: false, label: 'CHECKING' })
   const fileInput = useRef(null)
-  const selected = useMemo(() => tracks.find((track) => track.id === selectedId) ?? tracks[0], [tracks, selectedId])
+  const audioRef = useRef(null)
+  const emptyTrack = useMemo(() => ({ name: 'No track selected', codec: '', container: '—', sampleRateHz: 0, bitDepth: null, channelLayout: '—', truePeak: null, lufs: null }), [])
+  const selected = useMemo(() => tracks.find((track) => track.id === selectedId) ?? tracks[0] ?? emptyTrack, [tracks, selectedId, emptyTrack])
+  const [previewUrl, setPreviewUrl] = useState('')
 
   useEffect(() => {
     if (!isTauriRuntime()) {
@@ -186,10 +188,42 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    if (!playing) return undefined
-    const timer = window.setInterval(() => setPosition((current) => (current >= 0.985 ? 0.012 : current + 0.0025)), 120)
-    return () => window.clearInterval(timer)
-  }, [playing])
+    let active = true
+    const previewPath = abMode === 'B' && selected.outputPath ? selected.outputPath : selected.path
+    if (!previewPath || !isTauriRuntime()) {
+      setPreviewUrl('')
+      setPlaying(false)
+      setPosition(0)
+      return () => { active = false }
+    }
+    import('@tauri-apps/api/core').then(({ convertFileSrc }) => {
+      if (active) {
+        setPreviewUrl(convertFileSrc(previewPath))
+        setPlaying(false)
+        setPosition(0)
+      }
+    }).catch((error) => setNotice(error.message || 'Unable to load audio preview'))
+    return () => { active = false }
+  }, [selected.path, selected.outputPath, abMode])
+
+  const togglePlayback = async () => {
+    const audio = audioRef.current
+    if (!audio || !previewUrl) {
+      setNotice('Select an imported track first')
+      return
+    }
+    if (audio.paused) {
+      try { await audio.play() } catch (error) { setNotice(error.message || 'Playback failed') }
+    } else {
+      audio.pause()
+    }
+  }
+
+  const seekPreview = (delta) => {
+    const audio = audioRef.current
+    if (!audio) return
+    audio.currentTime = Math.max(0, Math.min(audio.duration || 0, audio.currentTime + delta))
+  }
 
   useEffect(() => {
     if (!notice) return undefined
@@ -308,7 +342,20 @@ export function App() {
   const exportAll = () => processTracks(tracks)
 
   return (
-    <main className={`app-shell ${importing ? 'is-importing' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files) }}>
+    <main className={`app-shell ${importing ? 'is-importing' : ''}`}>
+      <audio
+        ref={audioRef}
+        src={previewUrl}
+        preload="metadata"
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+        onTimeUpdate={(event) => {
+          const audio = event.currentTarget
+          setPosition(audio.duration ? audio.currentTime / audio.duration : 0)
+        }}
+      />
+      <div className="drop-surface" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files) }}>
       <input ref={fileInput} className="visually-hidden" type="file" multiple accept="audio/*,.wav,.wave,.flac,.mp3,.m4a,.aac,.ogg,.opus,.aif,.aiff" onChange={(event) => { addFiles(event.target.files); event.target.value = '' }} />
       <header className="brandbar"><strong>NAS <em>VocRep</em></strong></header>
 
@@ -336,9 +383,9 @@ export function App() {
         <div className="transport-row">
           <time>00:00.000</time>
           <div className="transport-controls">
-            <button type="button" aria-label="Previous"><SkipBack weight="fill" /></button><button type="button" aria-label="Rewind" onClick={() => setPosition(Math.max(.012, position - .08))}><SkipBack /></button>
-            <button className="play-button" type="button" aria-label={playing ? 'Pause' : 'Play'} onClick={() => setPlaying(!playing)}>{playing ? <Pause weight="fill" /> : <Play weight="fill" />}</button>
-            <button type="button" aria-label="Stop" onClick={() => { setPlaying(false); setPosition(.012) }}><Stop weight="fill" /></button><button type="button" aria-label="Fast forward" onClick={() => setPosition(Math.min(.98, position + .08))}><SkipForward /></button>
+            <button type="button" aria-label="Previous"><SkipBack weight="fill" /></button><button type="button" aria-label="Rewind" onClick={() => seekPreview(-10)}><SkipBack /></button>
+            <button className="play-button" type="button" aria-label={playing ? 'Pause' : 'Play'} onClick={togglePlayback}>{playing ? <Pause weight="fill" /> : <Play weight="fill" />}</button>
+            <button type="button" aria-label="Stop" onClick={() => { const audio = audioRef.current; if (audio) { audio.pause(); audio.currentTime = 0 } }}><Stop weight="fill" /></button><button type="button" aria-label="Fast forward" onClick={() => seekPreview(10)}><SkipForward /></button>
           </div>
           <div className="ab-control">{['A', 'B'].map((mode) => <button className={abMode === mode ? 'active' : ''} type="button" key={mode} onClick={() => setAbMode(mode)}>{mode}</button>)}<span>SYNC <b>ON</b></span></div>
         </div>
@@ -354,10 +401,11 @@ export function App() {
 
       <footer className="actionbar">
         <div className="project-info"><GearSix size={28} /><span>ENGINE: <strong>{engineStatus.label}</strong></span><span>{tracks.filter((track) => track.path).length} LOCAL TRACKS</span></div>
-        <button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={processSelected}><WaveformIcon weight="bold" />{processing ? 'PROCESSING…' : 'PROCESS SELECTED'}</button>
+        <button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={processSelected}><DownloadSimple weight="bold" />{processing ? 'EXPORTING…' : 'EXPORT SELECTED'}</button>
         <button className="export-button" type="button" onClick={exportAll} disabled={processing}><DownloadSimple /> {processing ? 'EXPORTING…' : 'EXPORT ALL FOR CUBASE'}</button>
       </footer>
       {notice && <div className="notice" role="status">{notice}</div>}
+      </div>
     </main>
   )
 }
