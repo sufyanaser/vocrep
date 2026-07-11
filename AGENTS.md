@@ -20,3 +20,6 @@ When implementing from a selected generated mock, treat that image as the source
 - Browser WAV verification must read the RIFF header; do not report the AudioContext playback rate as the source sample rate.
 - Never display placeholder True Peak, LUFS, RMS, clipping, or artifact values for imported files. Use `Pending` or `—` until measured.
 - Keep demo/reference tracks in `src/data/`; do not hard-code mutable track data inside UI components.
+- Waveforms must always be decoded from the selected audio file. Never draw seeded, random, decorative, or placeholder waveforms.
+- The waveform channel count follows the active A/B source: mono processed output is one lane; stereo input is two lanes.
+- `RUN PROCESS` must execute the enabled FFmpeg tools and switch B preview to the measured processed output.
