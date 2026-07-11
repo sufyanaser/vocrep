@@ -140,6 +140,8 @@ fn probe_audio_files(paths: Vec<String>) -> Vec<Result<AudioMetadata, String>> {
 pub struct ProcessOptions {
     pub mono: bool,
     pub normalize: bool,
+    pub repair: bool,
+    pub repair_mode: String,
     pub sample_rate: u32,
 }
 
@@ -161,6 +163,15 @@ fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, St
     Ok(output_dir.join(format!("{stem}_Ready{channel}{rate}.wav")))
 }
 
+fn repair_filter(mode: &str) -> Result<&'static str, String> {
+    match mode.to_ascii_lowercase().as_str() {
+        "light" => Ok("adeclick=w=40:o=70:a=2:t=2,afftdn=nf=-38:nr=5:tn=1"),
+        "balanced" => Ok("adeclick=w=55:o=75:a=2:t=2,afftdn=nf=-34:nr=9:tn=1"),
+        "strong" => Ok("adeclick=w=70:o=80:a=2:t=2,afftdn=nf=-30:nr=14:tn=1"),
+        _ => Err("Repair mode must be Light, Balanced, or Strong".to_string()),
+    }
+}
+
 fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessResult, String> {
     if options.sample_rate != 44_100 && options.sample_rate != 48_000 {
         return Err("Sample rate must be 44100 or 48000".to_string());
@@ -175,8 +186,15 @@ fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessRes
     if options.mono {
         command.args(["-ac", "1"]);
     }
+    let mut filters = Vec::new();
+    if options.repair {
+        filters.push(repair_filter(&options.repair_mode)?.to_string());
+    }
     if options.normalize {
-        command.args(["-af", "loudnorm=I=-18:TP=-1.0:LRA=11"]);
+        filters.push("loudnorm=I=-18:TP=-1.0:LRA=11".to_string());
+    }
+    if !filters.is_empty() {
+        command.args(["-af", &filters.join(",")]);
     }
     command.args([
         "-ar",
@@ -225,8 +243,16 @@ mod tests {
     }
 
     #[test]
+    fn resolves_repair_profiles() {
+        assert!(repair_filter("Light").unwrap().contains("nr=5"));
+        assert!(repair_filter("Balanced").unwrap().contains("nr=9"));
+        assert!(repair_filter("Strong").unwrap().contains("nr=14"));
+        assert!(repair_filter("Extreme").is_err());
+    }
+
+    #[test]
     fn creates_cubase_ready_output_name() {
-        let options = ProcessOptions { mono: true, normalize: true, sample_rate: 48_000 };
+        let options = ProcessOptions { mono: true, normalize: true, repair: true, repair_mode: "Balanced".to_string(), sample_rate: 48_000 };
         let output = output_path_for(Path::new("/tmp/Song01 Vocal.wav"), &options).unwrap();
         assert!(output.ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k.wav"));
     }

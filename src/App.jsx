@@ -261,6 +261,8 @@ export function App() {
       const result = await processNativeAudio(nativeTargets.map((track) => track.path), {
         mono,
         normalize,
+        repair,
+        repairMode,
         sampleRate: sampleRate === '44.1 kHz' ? 44100 : 48000,
       })
       const outputs = new Map(result.completed.map((item) => [item.inputPath, item.outputPath]))
