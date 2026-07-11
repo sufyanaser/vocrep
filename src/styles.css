@@ -20,7 +20,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--orange); o
 .is-importing .queue-heading button svg { animation: pulse 1s ease-in-out infinite alternate; }
 .track-list { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: none; padding: 0 12px; }
 .track-list::-webkit-scrollbar { display: none; }
-.track-row { width: 100%; min-height: 119px; position: relative; display: grid; grid-template-columns: 25px 34px 1fr 38px; align-items: start; gap: 8px; padding: 16px 13px; background: transparent; border: 0; border-bottom: 1px solid rgba(255,255,255,.08); text-align: left; cursor: pointer; }
+.track-row { width: 100%; min-height: 76px; position: relative; display: grid; grid-template-columns: 25px 34px 1fr 38px; align-items: start; gap: 8px; padding: 10px 13px; background: transparent; border: 0; border-bottom: 1px solid rgba(255,255,255,.08); text-align: left; cursor: pointer; }
 .track-row.selected { border: 2px solid var(--orange); border-radius: 4px; background: rgba(255,153,15,.025); padding: 14px 11px; }
 .track-number { color: #a5a7a9; font-size: 14px; }
 .track-play { margin-top: 38px; color: #e1e3e4; }
@@ -115,3 +115,6 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--orange); o
   .analysis-row { padding: 0 14px; }
   .actionbar { grid-template-columns: 1fr 315px 315px; gap: 14px; padding: 0 18px; }
 }
+
+.app-shell > audio { display: none; }
+.drop-surface { display: contents; }
