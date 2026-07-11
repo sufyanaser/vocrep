@@ -16,6 +16,8 @@ pub struct AudioMetadata {
     pub channel_layout: String,
     pub file_size: u64,
     pub source: String,
+    pub integrated_lufs: Option<f64>,
+    pub true_peak_dbtp: Option<f64>,
 }
 
 fn parse_number<T: std::str::FromStr>(value: Option<&Value>) -> Option<T> {
@@ -72,7 +74,30 @@ fn metadata_from_ffprobe(path: &str, payload: &Value) -> Result<AudioMetadata, S
         channel_layout,
         file_size: parse_number::<u64>(format.get("size")).unwrap_or(0),
         source: "ffprobe".to_string(),
+        integrated_lufs: None,
+        true_peak_dbtp: None,
     })
+}
+
+fn analyze_loudness(path: &str) -> Result<(f64, f64), String> {
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner", "-nostats", "-i", path,
+            "-af", "loudnorm=I=-18:TP=-1:LRA=11:print_format=json",
+            "-f", "null", "-",
+        ])
+        .output()
+        .map_err(|error| format!("Unable to start FFmpeg analysis: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let start = stderr.rfind('{').ok_or_else(|| "Loudness JSON not found".to_string())?;
+    let end = stderr.rfind('}').ok_or_else(|| "Loudness JSON is incomplete".to_string())?;
+    let payload: Value = serde_json::from_str(&stderr[start..=end])
+        .map_err(|error| format!("Invalid loudness response: {error}"))?;
+    let integrated = parse_number::<f64>(payload.get("input_i"))
+        .ok_or_else(|| "Integrated LUFS missing".to_string())?;
+    let true_peak = parse_number::<f64>(payload.get("input_tp"))
+        .ok_or_else(|| "True peak missing".to_string())?;
+    Ok((integrated, true_peak))
 }
 
 fn probe_audio_path(path: &str) -> Result<AudioMetadata, String> {
@@ -96,7 +121,12 @@ fn probe_audio_path(path: &str) -> Result<AudioMetadata, String> {
 
     let payload: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Invalid FFprobe response: {error}"))?;
-    metadata_from_ffprobe(path, &payload)
+    let mut metadata = metadata_from_ffprobe(path, &payload)?;
+    if let Ok((integrated_lufs, true_peak_dbtp)) = analyze_loudness(path) {
+        metadata.integrated_lufs = Some(integrated_lufs);
+        metadata.true_peak_dbtp = Some(true_peak_dbtp);
+    }
+    Ok(metadata)
 }
 
 #[tauri::command]
@@ -186,6 +216,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_loudness_numbers() {
+        let payload = serde_json::json!({ "input_i": "-17.82", "input_tp": "-1.14" });
+        assert_eq!(parse_number::<f64>(payload.get("input_i")), Some(-17.82));
+        assert_eq!(parse_number::<f64>(payload.get("input_tp")), Some(-1.14));
+    }
 
     #[test]
     fn creates_cubase_ready_output_name() {
