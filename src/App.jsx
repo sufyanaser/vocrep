@@ -39,8 +39,8 @@ function trackFromMetadata(metadata, index, now) {
     channelLayout: `${rawLayout.charAt(0).toUpperCase()}${rawLayout.slice(1)}`,
     fileSize: metadata.fileSize || 0,
     metadataSource: metadata.source,
-    truePeak: null,
-    lufs: null,
+    truePeak: Number.isFinite(metadata.truePeakDbtp) ? `${metadata.truePeakDbtp.toFixed(1)} dBTP` : null,
+    lufs: Number.isFinite(metadata.integratedLufs) ? `${metadata.integratedLufs.toFixed(1)} LUFS` : null,
   }
 }
 
@@ -211,7 +211,7 @@ export function App() {
   const addNativePaths = useCallback(async (paths) => {
     if (!paths?.length || importing) return
     setImporting(true)
-    setNotice(`Reading ${paths.length} track${paths.length > 1 ? 's' : ''} with FFprobe…`)
+    setNotice(`Analyzing ${paths.length} track${paths.length > 1 ? 's' : ''}…`)
     try {
       appendMetadata(await analyzeNativePaths(paths))
     } catch (error) {
