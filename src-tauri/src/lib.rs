@@ -31,13 +31,16 @@ fn first_version_line(tool: &str) -> Result<String, String> {
 fn check_audio_engine() -> AudioEngineStatus {
     let ffmpeg_version = first_version_line("ffmpeg");
     let ffprobe_version = first_version_line("ffprobe");
-    if let (Err(error), _) | (_, Err(error)) = (&ffmpeg_version, &ffprobe_version) {
+    let engine_error = ffmpeg_version.as_ref().err()
+        .or_else(|| ffprobe_version.as_ref().err())
+        .cloned();
+    if let Some(error) = engine_error {
         return AudioEngineStatus {
             ready: false,
             ffmpeg_version: ffmpeg_version.ok(),
             ffprobe_version: ffprobe_version.ok(),
             missing_filters: Vec::new(),
-            error: Some(error.clone()),
+            error: Some(error),
         };
     }
     let filters_output = Command::new("ffmpeg").args(["-hide_banner", "-filters"]).output();
