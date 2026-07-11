@@ -55,7 +55,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--orange); o
 
 .waveform-area { position: relative; padding: 37px 45px 8px 42px; border-bottom: 1px solid var(--line); overflow: hidden; background: #0e1113; }
 .timeline { position: absolute; left: 40px; right: 48px; top: 11px; display: flex; justify-content: space-between; color: #b5b7b8; font-size: 13px; }
-.waveform-canvas { width: 100%; height: 100%; display: block; }
+.waveform-canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
 .db-scale { position: absolute; right: 10px; top: 48px; bottom: 20px; display: flex; flex-direction: column; justify-content: space-between; color: #9a9c9e; font-size: 11px; }
 
 .transport-row { display: grid; grid-template-columns: 165px 1fr 215px; align-items: center; gap: 25px; padding: 0 28px; border-bottom: 1px solid var(--line); }
@@ -91,6 +91,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--orange); o
 .process-button, .export-button { height: 62px; border-radius: 4px; display: flex; align-items: center; justify-content: center; gap: 15px; font-weight: 600; font-size: 19px; letter-spacing: .02em; cursor: pointer; }
 .process-button { border: 1px solid #ffb632; color: #111; background: #ff9f12; box-shadow: 0 4px 18px rgba(255,137,0,.12); }
 .process-button.processing { animation: pulse 1s ease-in-out infinite alternate; }
+.process-button:disabled, .export-button:disabled { opacity: .45; cursor: not-allowed; }
 .export-button { border: 1px solid rgba(255,255,255,.2); background: #191c1e; color: #d8d9da; }
 .process-button svg, .export-button svg { width: 27px; height: 27px; }
 .notice { position: fixed; right: 28px; bottom: 118px; padding: 14px 18px; border: 1px solid rgba(255,152,15,.48); background: #171a1c; color: #e8e8e8; border-radius: 4px; box-shadow: 0 12px 36px #0009; animation: notice-in .24s ease-out; }

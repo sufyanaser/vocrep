@@ -221,6 +221,59 @@ pub struct ProcessResult {
     pub output_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaveformData {
+    pub channels: u32,
+    pub peaks: Vec<Vec<f32>>,
+}
+
+fn waveform_from_pcm(bytes: &[u8], channels: usize, points: usize) -> WaveformData {
+    let samples = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    let frames = samples.len() / channels.max(1);
+    let point_count = points.max(1).min(frames.max(1));
+    let mut peaks = vec![vec![0.0_f32; point_count]; channels.max(1)];
+    if frames == 0 {
+        return WaveformData { channels: channels as u32, peaks };
+    }
+    for point in 0..point_count {
+        let start = point * frames / point_count;
+        let end = ((point + 1) * frames / point_count).max(start + 1).min(frames);
+        for frame in start..end {
+            for channel in 0..channels {
+                let sample = samples[frame * channels + channel].abs();
+                peaks[channel][point] = peaks[channel][point].max(sample);
+            }
+        }
+    }
+    WaveformData { channels: channels as u32, peaks }
+}
+
+fn extract_waveform(path: &str, points: usize) -> Result<WaveformData, String> {
+    let metadata = probe_audio_path(path)?;
+    let channels = metadata.channels.max(1) as usize;
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner", "-loglevel", "error", "-i", path, "-vn",
+            "-ar", "2000", "-c:a", "pcm_f32le", "-f", "f32le", "-",
+        ])
+        .output()
+        .map_err(|error| format!("Unable to decode waveform: {error}"))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() { "Waveform decode failed".to_string() } else { message });
+    }
+    Ok(waveform_from_pcm(&output.stdout, channels, points))
+}
+
+#[tauri::command]
+fn get_audio_waveform(path: String, points: usize) -> Result<WaveformData, String> {
+    extract_waveform(&path, points.clamp(128, 2048))
+}
+
 fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, String> {
     let parent = input.parent().ok_or_else(|| "Input file has no parent folder".to_string())?;
     let output_dir = parent.join("CUBASE_READY");
@@ -295,7 +348,7 @@ fn process_audio_files(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![check_audio_engine, probe_audio_files, process_audio_files])
+        .invoke_handler(tauri::generate_handler![check_audio_engine, probe_audio_files, get_audio_waveform, process_audio_files])
         .run(tauri::generate_context!())
         .expect("error while running NAS VocRep");
 }
@@ -352,5 +405,15 @@ mod tests {
         assert_eq!(metadata.channels, 2);
         assert_eq!(metadata.duration_seconds, 222.125);
         assert_eq!(metadata.file_size, 63_972_044);
+    }
+
+    #[test]
+    fn creates_channel_accurate_waveform_peaks() {
+        let samples = [0.1_f32, -0.8, 0.6, 0.2, -0.4, 0.9, 0.3, -0.1];
+        let bytes = samples.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let waveform = waveform_from_pcm(&bytes, 2, 2);
+        assert_eq!(waveform.channels, 2);
+        assert_eq!(waveform.peaks[0], vec![0.6, 0.4]);
+        assert_eq!(waveform.peaks[1], vec![0.8, 0.9]);
     }
 }

@@ -58,6 +58,17 @@ async function decodeBrowserFile(file) {
     const extension = extensionOf(file.name)
     const wavFormat = extension === 'wav' || extension === 'wave' ? readWavFormat(buffer) : null
     const channels = wavFormat?.channels ?? decoded.numberOfChannels
+    const waveformPoints = 900
+    const waveform = Array.from({ length: decoded.numberOfChannels }, (_, channel) => {
+      const samples = decoded.getChannelData(channel)
+      return Array.from({ length: waveformPoints }, (_, point) => {
+        const start = Math.floor(point * samples.length / waveformPoints)
+        const end = Math.max(start + 1, Math.floor((point + 1) * samples.length / waveformPoints))
+        let peak = 0
+        for (let index = start; index < end; index += 1) peak = Math.max(peak, Math.abs(samples[index] || 0))
+        return peak
+      })
+    })
     return {
       path: null,
       name: file.name,
@@ -70,10 +81,17 @@ async function decodeBrowserFile(file) {
       channelLayout: channels === 1 ? 'mono' : channels === 2 ? 'stereo' : `${channels} channels`,
       fileSize: file.size,
       source: 'browser',
+      waveform,
     }
   } finally {
     await context.close()
   }
+}
+
+export async function getNativeWaveform(path, points = 900) {
+  if (!isTauriRuntime() || !path) return null
+  const { invoke } = await import('@tauri-apps/api/core')
+  return invoke('get_audio_waveform', { path, points })
 }
 
 export async function analyzeBrowserFiles(fileList) {

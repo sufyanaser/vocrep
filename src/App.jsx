@@ -10,6 +10,7 @@ import {
   analyzeNativePaths,
   browseNativeAudioFiles,
   formatDuration,
+  getNativeWaveform,
   isTauriRuntime,
   listenForNativeDrop,
   processNativeAudio,
@@ -19,6 +20,14 @@ function compactSampleRate(value) {
   if (!value) return '—'
   const kiloHertz = value / 1000
   return `${Number.isInteger(kiloHertz) ? kiloHertz : kiloHertz.toFixed(1)} kHz`
+}
+
+function clockLabel(seconds, milliseconds = false) {
+  if (!Number.isFinite(seconds) || seconds < 0) return milliseconds ? '00:00.000' : '0:00'
+  const minutes = Math.floor(seconds / 60)
+  const remainder = Math.floor(seconds % 60)
+  const fraction = milliseconds ? `.${String(Math.floor((seconds % 1) * 1000)).padStart(3, '0')}` : ''
+  return `${milliseconds ? String(minutes).padStart(2, '0') : minutes}:${String(remainder).padStart(2, '0')}${fraction}`
 }
 
 function trackFromMetadata(metadata, index, now) {
@@ -41,17 +50,11 @@ function trackFromMetadata(metadata, index, now) {
     metadataSource: metadata.source,
     truePeak: Number.isFinite(metadata.truePeakDbtp) ? `${metadata.truePeakDbtp.toFixed(1)} dBTP` : null,
     lufs: Number.isFinite(metadata.integratedLufs) ? `${metadata.integratedLufs.toFixed(1)} LUFS` : null,
+    waveform: metadata.waveform || null,
   }
 }
 
-function seededAmplitude(index, channel) {
-  const pulse = Math.abs(Math.sin(index * 0.109 + channel * 0.8))
-  const texture = Math.abs(Math.sin(index * 0.743) * Math.cos(index * 0.217))
-  const envelope = Math.min(1, index / 18) * Math.min(1, (250 - index) / 20)
-  return (0.18 + pulse * 0.42 + texture * 0.4) * Math.max(0.08, envelope)
-}
-
-function Waveform({ playing, position }) {
+function Waveform({ playing, position, peaks, channels, onSeek }) {
   const canvasRef = useRef(null)
 
   useEffect(() => {
@@ -76,10 +79,11 @@ function Waveform({ playing, position }) {
         context.stroke()
       }
 
-      const channelGap = 30
-      const channelHeight = (rect.height - channelGap) / 2
-      const centers = [channelHeight / 2, channelHeight + channelGap + channelHeight / 2]
-      const bars = 260
+      const visibleChannels = Math.max(1, Math.min(channels || peaks?.length || 1, peaks?.length || 1))
+      const channelGap = visibleChannels > 1 ? 30 : 0
+      const channelHeight = (rect.height - channelGap * (visibleChannels - 1)) / visibleChannels
+      const centers = Array.from({ length: visibleChannels }, (_, channel) => channel * (channelHeight + channelGap) + channelHeight / 2)
+      const bars = peaks?.[0]?.length || 0
       const step = rect.width / bars
       const waveformGradient = context.createLinearGradient(0, 0, rect.width, 0)
       waveformGradient.addColorStop(0, '#ff9818')
@@ -88,9 +92,9 @@ function Waveform({ playing, position }) {
       context.strokeStyle = waveformGradient
       context.lineWidth = Math.max(1, step * 0.56)
 
-      centers.forEach((center, channel) => {
+      if (bars) centers.forEach((center, channel) => {
         for (let index = 0; index < bars; index += 1) {
-          const amplitude = seededAmplitude(index, channel) * (channelHeight * 0.43)
+          const amplitude = Math.min(1, peaks[channel]?.[index] || 0) * (channelHeight * 0.43)
           const x = index * step + step / 2
           context.beginPath()
           context.moveTo(x, center - amplitude)
@@ -112,9 +116,9 @@ function Waveform({ playing, position }) {
     const observer = new ResizeObserver(draw)
     observer.observe(canvas)
     return () => observer.disconnect()
-  }, [playing, position])
+  }, [playing, position, peaks, channels])
 
-  return <canvas ref={canvasRef} className="waveform-canvas" aria-label="Stereo waveform preview" />
+  return <canvas ref={canvasRef} className="waveform-canvas" aria-label={`${channels === 1 ? 'Mono' : 'Stereo'} waveform preview`} onClick={(event) => onSeek?.(event.nativeEvent.offsetX / event.currentTarget.clientWidth)} />
 }
 
 function Toggle({ checked, onChange, label }) {
@@ -170,6 +174,34 @@ export function App() {
   const emptyTrack = useMemo(() => ({ name: 'No track selected', codec: '', container: '—', sampleRateHz: 0, bitDepth: null, channelLayout: '—', truePeak: null, lufs: null }), [])
   const selected = useMemo(() => tracks.find((track) => track.id === selectedId) ?? tracks[0] ?? emptyTrack, [tracks, selectedId, emptyTrack])
   const [previewUrl, setPreviewUrl] = useState('')
+  const previewWaveform = abMode === 'B' && selected.outputWaveform ? selected.outputWaveform : selected.waveform
+  const previewChannels = abMode === 'B' && selected.outputChannels ? selected.outputChannels : selected.channels
+  const activeMetadata = abMode === 'B' && selected.outputMetadata ? {
+    ...selected,
+    container: selected.outputMetadata.container,
+    codec: selected.outputMetadata.codec,
+    sampleRateHz: selected.outputMetadata.sampleRate,
+    bitDepth: selected.outputMetadata.bitDepth,
+    channelLayout: selected.outputMetadata.channelLayout,
+    channels: selected.outputMetadata.channels,
+    truePeak: Number.isFinite(selected.outputMetadata.truePeakDbtp) ? `${selected.outputMetadata.truePeakDbtp.toFixed(1)} dBTP` : null,
+    lufs: Number.isFinite(selected.outputMetadata.integratedLufs) ? `${selected.outputMetadata.integratedLufs.toFixed(1)} LUFS` : null,
+  } : selected
+  const currentSeconds = position * (activeMetadata.durationSeconds || selected.durationSeconds || 0)
+  const timelineLabels = Array.from({ length: 8 }, (_, index) => clockLabel((activeMetadata.durationSeconds || selected.durationSeconds || 0) * index / 7))
+
+  useEffect(() => {
+    const path = abMode === 'B' && selected.outputPath ? selected.outputPath : selected.path
+    if (!path || previewWaveform || !isTauriRuntime()) return
+    let active = true
+    getNativeWaveform(path).then((data) => {
+      if (!active || !data?.peaks) return
+      setTracks((current) => current.map((track) => track.id === selected.id
+        ? (abMode === 'B' ? { ...track, outputWaveform: data.peaks, outputChannels: data.channels } : { ...track, waveform: data.peaks, channels: data.channels })
+        : track))
+    }).catch((error) => setNotice(error.message || 'Unable to extract waveform'))
+    return () => { active = false }
+  }, [selected.id, selected.path, selected.outputPath, previewWaveform, abMode])
 
   useEffect(() => {
     if (!isTauriRuntime()) {
@@ -327,8 +359,19 @@ export function App() {
         const result = await processNativeAudio([target.path], options)
         if (!result.completed.length) throw new Error(result.errors[0] || 'Processing failed')
         const outputPath = result.completed[0].outputPath
+        const [outputMetadataResult, outputWaveform] = await Promise.all([
+          analyzeNativePaths([outputPath]),
+          getNativeWaveform(outputPath),
+        ])
+        const outputMetadata = outputMetadataResult.metadata[0]
         completedCount += 1
-        setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'done', progress: 100, outputPath } : track))
+        setTracks((current) => current.map((track) => track.id === target.id ? {
+          ...track, state: 'done', progress: 100, outputPath,
+          outputWaveform: outputWaveform?.peaks || null,
+          outputChannels: outputMetadata?.channels || outputWaveform?.channels || (mono ? 1 : track.channels),
+          outputMetadata,
+        } : track))
+        setAbMode('B')
       } catch (error) {
         failedCount += 1
         setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'error', progress: 0, error: error.message || 'Processing failed' } : track))
@@ -375,13 +418,13 @@ export function App() {
         </div>
 
         <div className="waveform-area">
-          <div className="timeline"><span>0:00</span><span>0:30</span><span>1:00</span><span>1:30</span><span>2:00</span><span>2:30</span><span>3:00</span><span>3:42</span></div>
-          <Waveform playing={playing} position={position} />
+          <div className="timeline">{timelineLabels.map((label, index) => <span key={`${label}-${index}`}>{label}</span>)}</div>
+          <Waveform playing={playing} position={position} peaks={previewWaveform} channels={previewChannels} onSeek={(ratio) => { const audio = audioRef.current; if (audio?.duration) audio.currentTime = ratio * audio.duration }} />
           <div className="db-scale"><span>0</span><span>-6</span><span>-12</span><span>-18</span><span>-24</span><span>-∞</span></div>
         </div>
 
         <div className="transport-row">
-          <time>00:00.000</time>
+          <time>{clockLabel(currentSeconds, true)}</time>
           <div className="transport-controls">
             <button type="button" aria-label="Previous"><SkipBack weight="fill" /></button><button type="button" aria-label="Rewind" onClick={() => seekPreview(-10)}><SkipBack /></button>
             <button className="play-button" type="button" aria-label={playing ? 'Pause' : 'Play'} onClick={togglePlayback}>{playing ? <Pause weight="fill" /> : <Play weight="fill" />}</button>
@@ -391,17 +434,17 @@ export function App() {
         </div>
 
         <div className="facts-row">
-          <div><span>FORMAT</span><strong title={selected.codec}>{selected.container}</strong></div><div><span>SAMPLE RATE</span><strong>{compactSampleRate(selected.sampleRateHz)}</strong></div><div><span>BIT DEPTH</span><strong>{selected.bitDepth ? `${selected.bitDepth}-bit` : '—'}</strong></div><div><span>CHANNELS</span><strong>{selected.channelLayout}</strong></div><div><span>TRUE PEAK</span><strong className={selected.truePeak ? 'peak' : ''}>{selected.truePeak ?? 'Pending'}</strong></div><div><span>INTEGRATED LUFS</span><strong className={selected.lufs ? 'lufs' : ''}>{selected.lufs ?? 'Pending'}</strong></div>
+          <div><span>FORMAT</span><strong title={activeMetadata.codec}>{activeMetadata.container}</strong></div><div><span>SAMPLE RATE</span><strong>{compactSampleRate(activeMetadata.sampleRateHz)}</strong></div><div><span>BIT DEPTH</span><strong>{activeMetadata.bitDepth ? `${activeMetadata.bitDepth}-bit` : '—'}</strong></div><div><span>CHANNELS</span><strong>{activeMetadata.channelLayout}</strong></div><div><span>TRUE PEAK</span><strong className={activeMetadata.truePeak ? 'peak' : ''}>{activeMetadata.truePeak ?? 'Pending'}</strong></div><div><span>INTEGRATED LUFS</span><strong className={activeMetadata.lufs ? 'lufs' : ''}>{activeMetadata.lufs ?? 'Pending'}</strong></div>
         </div>
 
         <div className="analysis-row">
-          <div className="analysis-title"><i /> ESTIMATED ANALYSIS</div><div><span>NOISE FLOOR (RMS)</span><strong>{selected.truePeak ? '-72.1 dB' : '—'}</strong></div><div><span>DYNAMIC RANGE</span><strong>{selected.truePeak ? '13.6 dB' : '—'}</strong></div><div><span>PEAK LEVEL</span><strong>{selected.truePeak ?? '—'}</strong></div><div><span>LOUDNESS RANGE</span><strong>{selected.lufs ? '7.2 LU' : '—'}</strong></div><div><span>CREST FACTOR</span><strong>{selected.truePeak ? '11.5 dB' : '—'}</strong></div><div><span>CLIPPING</span><strong>{selected.truePeak ? '0 samples' : '—'}</strong></div>
+          <div className="analysis-title"><i /> MEASURED ANALYSIS</div><div><span>NOISE FLOOR (RMS)</span><strong>—</strong></div><div><span>DYNAMIC RANGE</span><strong>—</strong></div><div><span>PEAK LEVEL</span><strong>{activeMetadata.truePeak ?? '—'}</strong></div><div><span>LOUDNESS RANGE</span><strong>—</strong></div><div><span>CREST FACTOR</span><strong>—</strong></div><div><span>CLIPPING</span><strong>—</strong></div>
         </div>
       </section>
 
       <footer className="actionbar">
         <div className="project-info"><GearSix size={28} /><span>ENGINE: <strong>{engineStatus.label}</strong></span><span>{tracks.filter((track) => track.path).length} LOCAL TRACKS</span></div>
-        <button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={processSelected}><DownloadSimple weight="bold" />{processing ? 'EXPORTING…' : 'EXPORT SELECTED'}</button>
+        <button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={processSelected} disabled={processing || !tracks.length}><DownloadSimple weight="bold" />{processing ? 'PROCESSING…' : 'RUN PROCESS'}</button>
         <button className="export-button" type="button" onClick={exportAll} disabled={processing}><DownloadSimple /> {processing ? 'EXPORTING…' : 'EXPORT ALL FOR CUBASE'}</button>
       </footer>
       {notice && <div className="notice" role="status">{notice}</div>}
