@@ -123,3 +123,21 @@ export async function listenForNativeDrop(onPaths) {
     if (event.payload.type === 'drop') onPaths(event.payload.paths)
   })
 }
+
+
+export async function processNativeAudio(paths, options) {
+  if (!isTauriRuntime()) throw new Error('Audio processing requires the desktop app')
+  if (!paths?.length) throw new Error('Import a local audio file first')
+  const { invoke } = await import('@tauri-apps/api/core')
+  const results = await invoke('process_audio_files', { paths, options })
+  const completed = []
+  const errors = []
+  results.forEach((result, index) => {
+    if (result?.Ok) completed.push(result.Ok)
+    else if (result?.ok) completed.push(result.ok)
+    else if (result?.Err || result?.err) errors.push(result.Err ?? result.err)
+    else if (result?.outputPath) completed.push(result)
+    else errors.push(paths[index] + ': processing failed')
+  })
+  return { completed, errors }
+}
