@@ -2,6 +2,72 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fs, path::{Path, PathBuf}, process::Command};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioEngineStatus {
+    pub ready: bool,
+    pub ffmpeg_version: Option<String>,
+    pub ffprobe_version: Option<String>,
+    pub missing_filters: Vec<String>,
+    pub error: Option<String>,
+}
+
+fn first_version_line(tool: &str) -> Result<String, String> {
+    let output = Command::new(tool)
+        .arg("-version")
+        .output()
+        .map_err(|error| format!("Unable to start {tool}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{tool} version check failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("unknown version")
+        .to_string())
+}
+
+#[tauri::command]
+fn check_audio_engine() -> AudioEngineStatus {
+    let ffmpeg_version = first_version_line("ffmpeg");
+    let ffprobe_version = first_version_line("ffprobe");
+    if let (Err(error), _) | (_, Err(error)) = (&ffmpeg_version, &ffprobe_version) {
+        return AudioEngineStatus {
+            ready: false,
+            ffmpeg_version: ffmpeg_version.ok(),
+            ffprobe_version: ffprobe_version.ok(),
+            missing_filters: Vec::new(),
+            error: Some(error.clone()),
+        };
+    }
+    let filters_output = Command::new("ffmpeg").args(["-hide_banner", "-filters"]).output();
+    let filters = match filters_output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
+        Ok(_) => String::new(),
+        Err(error) => {
+            return AudioEngineStatus {
+                ready: false,
+                ffmpeg_version: ffmpeg_version.ok(),
+                ffprobe_version: ffprobe_version.ok(),
+                missing_filters: Vec::new(),
+                error: Some(format!("Unable to inspect FFmpeg filters: {error}")),
+            }
+        }
+    };
+    let required = ["adeclick", "afftdn", "loudnorm"];
+    let missing_filters = required.iter()
+        .filter(|name| !filters.contains(**name))
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    AudioEngineStatus {
+        ready: missing_filters.is_empty(),
+        ffmpeg_version: ffmpeg_version.ok(),
+        ffprobe_version: ffprobe_version.ok(),
+        error: if missing_filters.is_empty() { None } else { Some("Required FFmpeg filters are unavailable".to_string()) },
+        missing_filters,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioMetadata {
@@ -226,7 +292,7 @@ fn process_audio_files(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![probe_audio_files, process_audio_files])
+        .invoke_handler(tauri::generate_handler![check_audio_engine, probe_audio_files, process_audio_files])
         .run(tauri::generate_context!())
         .expect("error while running NAS VocRep");
 }
