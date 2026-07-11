@@ -141,3 +141,10 @@ export async function processNativeAudio(paths, options) {
   })
   return { completed, errors }
 }
+
+
+export async function checkNativeAudioEngine() {
+  if (!isTauriRuntime()) return { ready: false, error: 'Desktop runtime required', missingFilters: [] }
+  const { invoke } = await import('@tauri-apps/api/core')
+  return invoke('check_audio_engine')
+}

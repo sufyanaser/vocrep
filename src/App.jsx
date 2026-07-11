@@ -6,6 +6,7 @@ import {
 } from '@phosphor-icons/react'
 import {
   analyzeBrowserFiles,
+  checkNativeAudioEngine,
   analyzeNativePaths,
   browseNativeAudioFiles,
   formatDuration,
@@ -135,7 +136,7 @@ function Tool({ icon, title, children, wide = false }) {
 }
 
 function TrackRow({ track, index, selected, onSelect }) {
-  const statusIcon = track.state === 'done' ? <Check weight="bold" /> : null
+  const statusIcon = track.state === 'done' ? <Check weight="bold" /> : track.state === 'working' ? 'RUN' : track.state === 'error' ? 'ERR' : null
   return (
     <button className={`track-row ${selected ? 'selected' : ''}`} type="button" onClick={onSelect}>
       <span className="track-number">{index + 1}</span>
@@ -164,8 +165,25 @@ export function App() {
   const [processing, setProcessing] = useState(false)
   const [importing, setImporting] = useState(false)
   const [notice, setNotice] = useState('')
+  const [engineStatus, setEngineStatus] = useState({ ready: false, label: 'CHECKING' })
   const fileInput = useRef(null)
   const selected = useMemo(() => tracks.find((track) => track.id === selectedId) ?? tracks[0], [tracks, selectedId])
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      setEngineStatus({ ready: false, label: 'PREVIEW' })
+      return
+    }
+    checkNativeAudioEngine()
+      .then((status) => {
+        setEngineStatus({ ready: status.ready, label: status.ready ? 'READY' : 'MISSING' })
+        if (!status.ready) setNotice(status.error || 'FFmpeg engine is incomplete')
+      })
+      .catch((error) => {
+        setEngineStatus({ ready: false, label: 'ERROR' })
+        setNotice(error.message || 'Audio engine check failed')
+      })
+  }, [])
 
   useEffect(() => {
     if (!playing) return undefined
@@ -249,41 +267,41 @@ export function App() {
 
   const processTracks = async (targets) => {
     if (processing) return
+    if (!engineStatus.ready) {
+      setNotice('FFmpeg engine is not ready')
+      return
+    }
     const nativeTargets = targets.filter((track) => track.path)
     if (!nativeTargets.length) {
       setNotice('Import local tracks to process them')
       return
     }
-    const targetIds = new Set(nativeTargets.map((track) => track.id))
-    setProcessing(true)
-    setTracks((current) => current.map((track) => targetIds.has(track.id) ? { ...track, state: 'working', progress: 32 } : track))
-    try {
-      const result = await processNativeAudio(nativeTargets.map((track) => track.path), {
-        mono,
-        normalize,
-        repair,
-        repairMode,
-        sampleRate: sampleRate === '44.1 kHz' ? 44100 : 48000,
-      })
-      const outputs = new Map(result.completed.map((item) => [item.inputPath, item.outputPath]))
-      setTracks((current) => current.map((track) => {
-        if (!targetIds.has(track.id)) return track
-        const outputPath = outputs.get(track.path)
-        return outputPath
-          ? { ...track, state: 'done', progress: 100, outputPath }
-          : { ...track, state: 'error', progress: 0 }
-      }))
-      if (result.errors.length) {
-        setNotice(`${result.completed.length} exported · ${result.errors.length} failed`)
-      } else {
-        setNotice(`${result.completed.length} track${result.completed.length > 1 ? 's' : ''} saved to CUBASE_READY`)
-      }
-    } catch (error) {
-      setTracks((current) => current.map((track) => targetIds.has(track.id) ? { ...track, state: 'ready', progress: 100 } : track))
-      setNotice(error.message || 'Batch processing failed')
-    } finally {
-      setProcessing(false)
+    const options = {
+      mono,
+      normalize,
+      repair,
+      repairMode,
+      sampleRate: sampleRate === '44.1 kHz' ? 44100 : 48000,
     }
+    setProcessing(true)
+    let completedCount = 0
+    let failedCount = 0
+    for (const target of nativeTargets) {
+      setSelectedId(target.id)
+      setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'working', progress: 0, error: null } : track))
+      try {
+        const result = await processNativeAudio([target.path], options)
+        if (!result.completed.length) throw new Error(result.errors[0] || 'Processing failed')
+        const outputPath = result.completed[0].outputPath
+        completedCount += 1
+        setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'done', progress: 100, outputPath } : track))
+      } catch (error) {
+        failedCount += 1
+        setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'error', progress: 0, error: error.message || 'Processing failed' } : track))
+      }
+    }
+    setProcessing(false)
+    setNotice(failedCount ? `${completedCount} exported · ${failedCount} failed` : `${completedCount} track${completedCount > 1 ? 's' : ''} saved to CUBASE_READY`)
   }
 
   const processSelected = () => processTracks(selected ? [selected] : [])
@@ -335,7 +353,7 @@ export function App() {
       </section>
 
       <footer className="actionbar">
-        <div className="project-info"><GearSix size={28} /><span>Project: <strong>Song01</strong></span><span>Date: 2026-07-11</span></div>
+        <div className="project-info"><GearSix size={28} /><span>ENGINE: <strong>{engineStatus.label}</strong></span><span>{tracks.filter((track) => track.path).length} LOCAL TRACKS</span></div>
         <button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={processSelected}><WaveformIcon weight="bold" />{processing ? 'PROCESSING…' : 'PROCESS SELECTED'}</button>
         <button className="export-button" type="button" onClick={exportAll} disabled={processing}><DownloadSimple /> {processing ? 'EXPORTING…' : 'EXPORT ALL FOR CUBASE'}</button>
       </footer>
