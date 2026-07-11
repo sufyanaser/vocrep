@@ -11,6 +11,7 @@ import {
   formatDuration,
   isTauriRuntime,
   listenForNativeDrop,
+  processNativeAudio,
 } from './lib/audioFiles.js'
 import { demoTracks } from './data/demoTracks.js'
 
@@ -246,15 +247,35 @@ export function App() {
     }
   }, [addNativePaths])
 
-  const processSelected = () => {
+  const processSelected = async () => {
     if (processing) return
+    if (!selected?.path) {
+      setNotice('Import a local track to process it')
+      return
+    }
     setProcessing(true)
     setTracks((current) => current.map((track) => track.id === selectedId ? { ...track, state: 'working', progress: 32 } : track))
-    window.setTimeout(() => {
-      setTracks((current) => current.map((track) => track.id === selectedId ? { ...track, state: 'done', progress: 100 } : track))
+    try {
+      const result = await processNativeAudio([selected.path], {
+        mono,
+        normalize,
+        sampleRate: sampleRate === '44.1 kHz' ? 44100 : 48000,
+      })
+      if (!result.completed.length) throw new Error(result.errors[0] || 'Processing failed')
+      const outputPath = result.completed[0].outputPath
+      setTracks((current) => current.map((track) => track.id === selectedId ? {
+        ...track,
+        state: 'done',
+        progress: 100,
+        outputPath,
+      } : track))
+      setNotice('Saved to CUBASE_READY')
+    } catch (error) {
+      setTracks((current) => current.map((track) => track.id === selectedId ? { ...track, state: 'ready', progress: 100 } : track))
+      setNotice(error.message || 'Processing failed')
+    } finally {
       setProcessing(false)
-      setNotice('Processing recipe completed')
-    }, 1400)
+    }
   }
 
   return (
@@ -305,7 +326,7 @@ export function App() {
       <footer className="actionbar">
         <div className="project-info"><GearSix size={28} /><span>Project: <strong>Song01</strong></span><span>Date: 2026-07-11</span></div>
         <button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={processSelected}><WaveformIcon weight="bold" />{processing ? 'PROCESSING…' : 'PROCESS SELECTED'}</button>
-        <button className="export-button" type="button" onClick={() => setNotice(`${selected.name} ready for Cubase`)}><DownloadSimple /> EXPORT FOR CUBASE</button>
+        <button className="export-button" type="button" onClick={() => setNotice(selected.outputPath ? 'Saved in CUBASE_READY' : 'Process the selected track first')}><DownloadSimple /> EXPORT FOR CUBASE</button>
       </footer>
       {notice && <div className="notice" role="status">{notice}</div>}
     </main>
