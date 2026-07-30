@@ -1,6 +1,32 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, path::{Path, PathBuf}, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn hidden_command(program: &str) -> Command {
+    let command = Command::new(program);
+
+    #[cfg(windows)]
+    {
+        let mut command = command;
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        command
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -13,7 +39,7 @@ pub struct AudioEngineStatus {
 }
 
 fn first_version_line(tool: &str) -> Result<String, String> {
-    let output = Command::new(tool)
+    let output = hidden_command(tool)
         .arg("-version")
         .output()
         .map_err(|error| format!("Unable to start {tool}: {error}"))?;
@@ -31,7 +57,9 @@ fn first_version_line(tool: &str) -> Result<String, String> {
 fn check_audio_engine() -> AudioEngineStatus {
     let ffmpeg_version = first_version_line("ffmpeg");
     let ffprobe_version = first_version_line("ffprobe");
-    let engine_error = ffmpeg_version.as_ref().err()
+    let engine_error = ffmpeg_version
+        .as_ref()
+        .err()
         .or_else(|| ffprobe_version.as_ref().err())
         .cloned();
     if let Some(error) = engine_error {
@@ -43,9 +71,13 @@ fn check_audio_engine() -> AudioEngineStatus {
             error: Some(error),
         };
     }
-    let filters_output = Command::new("ffmpeg").args(["-hide_banner", "-filters"]).output();
+    let filters_output = hidden_command("ffmpeg")
+        .args(["-hide_banner", "-filters"])
+        .output();
     let filters = match filters_output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
         Ok(_) => String::new(),
         Err(error) => {
             return AudioEngineStatus {
@@ -58,7 +90,8 @@ fn check_audio_engine() -> AudioEngineStatus {
         }
     };
     let required = ["adeclick", "afftdn", "loudnorm"];
-    let missing_filters = required.iter()
+    let missing_filters = required
+        .iter()
         .filter(|name| !filters.contains(*name))
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
@@ -66,7 +99,11 @@ fn check_audio_engine() -> AudioEngineStatus {
         ready: missing_filters.is_empty(),
         ffmpeg_version: ffmpeg_version.ok(),
         ffprobe_version: ffprobe_version.ok(),
-        error: if missing_filters.is_empty() { None } else { Some("Required FFmpeg filters are unavailable".to_string()) },
+        error: if missing_filters.is_empty() {
+            None
+        } else {
+            Some("Required FFmpeg filters are unavailable".to_string())
+        },
         missing_filters,
     }
 }
@@ -90,7 +127,9 @@ pub struct AudioMetadata {
 }
 
 fn parse_number<T: std::str::FromStr>(value: Option<&Value>) -> Option<T> {
-    value.and_then(Value::as_str).and_then(|raw| raw.parse::<T>().ok())
+    value
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.parse::<T>().ok())
 }
 
 fn metadata_from_ffprobe(path: &str, payload: &Value) -> Result<AudioMetadata, String> {
@@ -130,7 +169,10 @@ fn metadata_from_ffprobe(path: &str, payload: &Value) -> Result<AudioMetadata, S
     Ok(AudioMetadata {
         path: path.to_string(),
         name,
-        container: format["format_name"].as_str().unwrap_or("unknown").to_uppercase(),
+        container: format["format_name"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_uppercase(),
         codec: stream["codec_long_name"]
             .as_str()
             .or_else(|| stream["codec_name"].as_str())
@@ -149,17 +191,28 @@ fn metadata_from_ffprobe(path: &str, payload: &Value) -> Result<AudioMetadata, S
 }
 
 fn analyze_loudness(path: &str) -> Result<(f64, f64), String> {
-    let output = Command::new("ffmpeg")
+    let output = hidden_command("ffmpeg")
         .args([
-            "-hide_banner", "-nostats", "-i", path,
-            "-af", "loudnorm=I=-18:TP=-1:LRA=11:print_format=json",
-            "-f", "null", "-",
+            "-hide_banner",
+            "-nostdin",
+            "-nostats",
+            "-i",
+            path,
+            "-af",
+            "loudnorm=I=-18:TP=-1:LRA=11:print_format=json",
+            "-f",
+            "null",
+            "-",
         ])
         .output()
         .map_err(|error| format!("Unable to start FFmpeg analysis: {error}"))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let start = stderr.rfind('{').ok_or_else(|| "Loudness JSON not found".to_string())?;
-    let end = stderr.rfind('}').ok_or_else(|| "Loudness JSON is incomplete".to_string())?;
+    let start = stderr
+        .rfind('{')
+        .ok_or_else(|| "Loudness JSON not found".to_string())?;
+    let end = stderr
+        .rfind('}')
+        .ok_or_else(|| "Loudness JSON is incomplete".to_string())?;
     let payload: Value = serde_json::from_str(&stderr[start..=end])
         .map_err(|error| format!("Invalid loudness response: {error}"))?;
     let integrated = parse_number::<f64>(payload.get("input_i"))
@@ -169,8 +222,8 @@ fn analyze_loudness(path: &str) -> Result<(f64, f64), String> {
     Ok((integrated, true_peak))
 }
 
-fn probe_audio_path(path: &str) -> Result<AudioMetadata, String> {
-    let output = Command::new("ffprobe")
+fn probe_audio_metadata(path: &str) -> Result<AudioMetadata, String> {
+    let output = hidden_command("ffprobe")
         .args([
             "-v",
             "error",
@@ -185,24 +238,45 @@ fn probe_audio_path(path: &str) -> Result<AudioMetadata, String> {
 
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() { "FFprobe failed".to_string() } else { message });
+        return Err(if message.is_empty() {
+            "FFprobe failed".to_string()
+        } else {
+            message
+        });
     }
 
     let payload: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Invalid FFprobe response: {error}"))?;
-    let mut metadata = metadata_from_ffprobe(path, &payload)?;
-    if let Ok((integrated_lufs, true_peak_dbtp)) = analyze_loudness(path) {
-        metadata.integrated_lufs = Some(integrated_lufs);
-        metadata.true_peak_dbtp = Some(true_peak_dbtp);
+    metadata_from_ffprobe(path, &payload)
+}
+
+fn is_processed_output(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("CUBASE_READY")
+    })
+}
+
+fn probe_audio_path(path: &str) -> Result<AudioMetadata, String> {
+    let mut metadata = probe_audio_metadata(path)?;
+    if is_processed_output(path) {
+        if let Ok((integrated_lufs, true_peak_dbtp)) = analyze_loudness(path) {
+            metadata.integrated_lufs = Some(integrated_lufs);
+            metadata.true_peak_dbtp = Some(true_peak_dbtp);
+        }
     }
     Ok(metadata)
 }
 
 #[tauri::command]
 fn probe_audio_files(paths: Vec<String>) -> Vec<Result<AudioMetadata, String>> {
-    paths.into_iter().map(|path| probe_audio_path(&path)).collect()
+    paths
+        .into_iter()
+        .map(|path| probe_audio_path(&path))
+        .collect()
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,11 +311,16 @@ fn waveform_from_pcm(bytes: &[u8], channels: usize, points: usize) -> WaveformDa
     let point_count = points.max(1).min(frames.max(1));
     let mut peaks = vec![vec![0.0_f32; point_count]; channels.max(1)];
     if frames == 0 {
-        return WaveformData { channels: channels as u32, peaks };
+        return WaveformData {
+            channels: channels as u32,
+            peaks,
+        };
     }
     for point in 0..point_count {
         let start = point * frames / point_count;
-        let end = ((point + 1) * frames / point_count).max(start + 1).min(frames);
+        let end = ((point + 1) * frames / point_count)
+            .max(start + 1)
+            .min(frames);
         for frame in start..end {
             for channel in 0..channels {
                 let sample = samples[frame * channels + channel].abs();
@@ -249,22 +328,41 @@ fn waveform_from_pcm(bytes: &[u8], channels: usize, points: usize) -> WaveformDa
             }
         }
     }
-    WaveformData { channels: channels as u32, peaks }
+    WaveformData {
+        channels: channels as u32,
+        peaks,
+    }
 }
 
 fn extract_waveform(path: &str, points: usize) -> Result<WaveformData, String> {
-    let metadata = probe_audio_path(path)?;
+    let metadata = probe_audio_metadata(path)?;
     let channels = metadata.channels.max(1) as usize;
-    let output = Command::new("ffmpeg")
+    let output = hidden_command("ffmpeg")
         .args([
-            "-hide_banner", "-loglevel", "error", "-i", path, "-vn",
-            "-ar", "2000", "-c:a", "pcm_f32le", "-f", "f32le", "-",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-i",
+            path,
+            "-vn",
+            "-ar",
+            "2000",
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "f32le",
+            "-",
         ])
         .output()
         .map_err(|error| format!("Unable to decode waveform: {error}"))?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() { "Waveform decode failed".to_string() } else { message });
+        return Err(if message.is_empty() {
+            "Waveform decode failed".to_string()
+        } else {
+            message
+        });
     }
     Ok(waveform_from_pcm(&output.stdout, channels, points))
 }
@@ -275,13 +373,22 @@ fn get_audio_waveform(path: String, points: usize) -> Result<WaveformData, Strin
 }
 
 fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, String> {
-    let parent = input.parent().ok_or_else(|| "Input file has no parent folder".to_string())?;
+    let parent = input
+        .parent()
+        .ok_or_else(|| "Input file has no parent folder".to_string())?;
     let output_dir = parent.join("CUBASE_READY");
     fs::create_dir_all(&output_dir)
         .map_err(|error| format!("Unable to create CUBASE_READY: {error}"))?;
-    let stem = input.file_stem().and_then(|value| value.to_str()).unwrap_or("track");
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("track");
     let channel = if options.mono { "_Mono" } else { "" };
-    let rate = if options.sample_rate == 44_100 { "_44k" } else { "_48k" };
+    let rate = if options.sample_rate == 44_100 {
+        "_44k"
+    } else {
+        "_48k"
+    };
     Ok(output_dir.join(format!("{stem}_Ready{channel}{rate}.wav")))
 }
 
@@ -303,8 +410,17 @@ fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessRes
         return Err(format!("Audio file not found: {path}"));
     }
     let output_path = output_path_for(input, options)?;
-    let mut command = Command::new("ffmpeg");
-    command.args(["-hide_banner", "-loglevel", "error", "-y", "-i", path, "-vn"]);
+    let mut command = hidden_command("ffmpeg");
+    command.args([
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        path,
+        "-vn",
+    ]);
     if options.mono {
         command.args(["-ac", "1"]);
     }
@@ -325,10 +441,16 @@ fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessRes
         "pcm_s24le",
         output_path.to_string_lossy().as_ref(),
     ]);
-    let result = command.output().map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
+    let result = command
+        .output()
+        .map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
     if !result.status.success() {
         let message = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        return Err(if message.is_empty() { "FFmpeg processing failed".to_string() } else { message });
+        return Err(if message.is_empty() {
+            "FFmpeg processing failed".to_string()
+        } else {
+            message
+        });
     }
     Ok(ProcessResult {
         input_path: path.to_string(),
@@ -341,14 +463,22 @@ fn process_audio_files(
     paths: Vec<String>,
     options: ProcessOptions,
 ) -> Vec<Result<ProcessResult, String>> {
-    paths.into_iter().map(|path| process_audio_path(&path, &options)).collect()
+    paths
+        .into_iter()
+        .map(|path| process_audio_path(&path, &options))
+        .collect()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![check_audio_engine, probe_audio_files, get_audio_waveform, process_audio_files])
+        .invoke_handler(tauri::generate_handler![
+            check_audio_engine,
+            probe_audio_files,
+            get_audio_waveform,
+            process_audio_files
+        ])
         .run(tauri::generate_context!())
         .expect("error while running NAS VocRep");
 }
@@ -365,6 +495,13 @@ mod tests {
     }
 
     #[test]
+    fn identifies_processed_output_path() {
+        let output = Path::new("/tmp").join("CUBASE_READY").join("Song01.wav");
+        assert!(is_processed_output(output.to_string_lossy().as_ref()));
+        assert!(!is_processed_output("/tmp/Song01.wav"));
+    }
+
+    #[test]
     fn resolves_repair_profiles() {
         assert!(repair_filter("Light").unwrap().contains("nr=5"));
         assert!(repair_filter("Balanced").unwrap().contains("nr=9"));
@@ -374,7 +511,13 @@ mod tests {
 
     #[test]
     fn creates_cubase_ready_output_name() {
-        let options = ProcessOptions { mono: true, normalize: true, repair: true, repair_mode: "Balanced".to_string(), sample_rate: 48_000 };
+        let options = ProcessOptions {
+            mono: true,
+            normalize: true,
+            repair: true,
+            repair_mode: "Balanced".to_string(),
+            sample_rate: 48_000,
+        };
         let output = output_path_for(Path::new("/tmp/Song01 Vocal.wav"), &options).unwrap();
         assert!(output.ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k.wav"));
     }
@@ -410,7 +553,10 @@ mod tests {
     #[test]
     fn creates_channel_accurate_waveform_peaks() {
         let samples = [0.1_f32, -0.8, 0.6, 0.2, -0.4, 0.9, 0.3, -0.1];
-        let bytes = samples.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let bytes = samples
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
         let waveform = waveform_from_pcm(&bytes, 2, 2);
         assert_eq!(waveform.channels, 2);
         assert_eq!(waveform.peaks[0], vec![0.6, 0.4]);
