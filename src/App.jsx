@@ -138,6 +138,89 @@ function TrackRow({ track, index, selected, disabled, onSelect, onRemove }) {
   )
 }
 
+const PROCESS_STAGES = [
+  { id: 'preparing', label: 'PREPARING', detail: 'Validating track and output settings' },
+  { id: 'processing', label: 'PROCESSING AUDIO', detail: 'Running the selected audio operations' },
+  { id: 'analyzing', label: 'ANALYZING OUTPUT', detail: 'Reading metadata, LUFS, and True Peak' },
+  { id: 'preview', label: 'BUILDING PREVIEW', detail: 'Generating the processed waveform' },
+  { id: 'complete', label: 'COMPLETE', detail: 'Output is ready for A/B preview' },
+]
+
+const FINAL_PROCESS_STATUSES = new Set(['complete', 'complete-with-errors', 'error'])
+
+function paintNextFrame() {
+  return new Promise((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(resolve)))
+}
+
+function ProcessingModal({ session, onClose }) {
+  const currentIndex = Math.max(0, PROCESS_STAGES.findIndex((stage) => stage.id === session.stage))
+  const isFinal = FINAL_PROCESS_STATUSES.has(session.status)
+  const remaining = Math.max(0, session.totalTracks - session.completed - session.failed)
+  const title = session.status === 'complete'
+    ? 'PROCESSING COMPLETE'
+    : session.status === 'error'
+      ? 'PROCESSING FAILED'
+      : session.status === 'complete-with-errors'
+        ? 'COMPLETE WITH ERRORS'
+        : 'PROCESSING TRACKS'
+
+  return (
+    <div className="processing-overlay" role="dialog" aria-modal="true" aria-labelledby="processing-title">
+      <section className={`processing-modal status-${session.status}`} aria-live="polite">
+        <header className="processing-header">
+          <div>
+            <span className="processing-kicker">NAS VOCREP V02</span>
+            <h2 id="processing-title">{title}</h2>
+          </div>
+          <span className="processing-counter">TRACK {session.trackIndex} / {session.totalTracks}</span>
+        </header>
+
+        <div className="processing-track">
+          <span>CURRENT TRACK</span>
+          <strong title={session.trackName}>{session.trackName}</strong>
+        </div>
+
+        <ol className="processing-stages">
+          {PROCESS_STAGES.map((stage, index) => {
+            const isDone = session.stage === 'complete' || index < currentIndex
+            const isError = Boolean(session.error)
+              && ['track-error', 'error', 'complete-with-errors'].includes(session.status)
+              && index === currentIndex
+              && session.stage !== 'complete'
+            const isActive = !isFinal && !isError && index === currentIndex
+            const stateClass = isDone ? 'is-done' : isError ? 'is-error' : isActive ? 'is-active' : 'is-pending'
+            return (
+              <li className={stateClass} key={stage.id}>
+                <span className="stage-marker">
+                  {isDone ? <Check weight="bold" /> : isError ? <X weight="bold" /> : isActive ? <i /> : <b>{index + 1}</b>}
+                </span>
+                <span className="stage-copy">
+                  <strong>{stage.label}</strong>
+                  <small>{stage.detail}</small>
+                </span>
+              </li>
+            )
+          })}
+        </ol>
+
+        <div className="processing-totals">
+          <div><span>COMPLETED</span><strong>{session.completed}</strong></div>
+          <div><span>FAILED</span><strong className={session.failed ? 'has-failures' : ''}>{session.failed}</strong></div>
+          <div><span>REMAINING</span><strong>{remaining}</strong></div>
+        </div>
+
+        {session.error && <div className="processing-error" role="alert">{session.error}</div>}
+
+        {isFinal && (
+          <button className="processing-close" type="button" onClick={onClose}>
+            CLOSE
+          </button>
+        )}
+      </section>
+    </div>
+  )
+}
+
 export function App() {
   const [tracks, setTracks] = useState([])
   const [selectedId, setSelectedId] = useState(null)
@@ -150,9 +233,10 @@ export function App() {
   const [abMode, setAbMode] = useState('A')
   const [position, setPosition] = useState(0)
   const [processing, setProcessing] = useState(false)
+  const [processSession, setProcessSession] = useState(null)
   const [importing, setImporting] = useState(false)
   const [notice, setNotice] = useState('')
-  const [engineStatus, setEngineStatus] = useState({ ready: false, label: 'CHECKING' })
+  const [engineStatus, setEngineStatus] = useState(() => isTauriRuntime() ? { ready: false, label: 'CHECKING' } : { ready: false, label: 'PREVIEW' })
   const fileInput = useRef(null)
   const audioRef = useRef(null)
   const emptyTrack = useMemo(() => ({ name: 'No track selected', codec: '', container: '—', sampleRateHz: 0, bitDepth: null, channelLayout: '—', truePeak: null, lufs: null }), [])
@@ -264,7 +348,7 @@ export function App() {
   }, [processing])
 
   useEffect(() => {
-    if (!isTauriRuntime()) return setEngineStatus({ ready: false, label: 'PREVIEW' })
+    if (!isTauriRuntime()) return undefined
     checkNativeAudioEngine().then((status) => {
       setEngineStatus({ ready: status.ready, label: status.ready ? 'READY' : 'MISSING' })
       if (!status.ready) setNotice(status.error || 'FFmpeg engine is incomplete')
@@ -292,7 +376,15 @@ export function App() {
   useEffect(() => {
     let active = true
     const previewPath = abMode === 'B' && selected.outputPath ? selected.outputPath : selected.path
-    if (!previewPath || !isTauriRuntime()) { setPreviewUrl(''); setPlaying(false); setPosition(0); return () => { active = false } }
+    if (!previewPath || !isTauriRuntime()) {
+      queueMicrotask(() => {
+        if (!active) return
+        setPreviewUrl('')
+        setPlaying(false)
+        setPosition(0)
+      })
+      return () => { active = false }
+    }
     import('@tauri-apps/api/core').then(({ convertFileSrc }) => { if (active) { setPreviewUrl(convertFileSrc(previewPath)); setPlaying(false); setPosition(0) } }).catch((error) => setNotice(error.message || 'Unable to load audio preview'))
     return () => { active = false }
   }, [selected.path, selected.outputPath, abMode])
@@ -315,27 +407,87 @@ export function App() {
     const nativeTargets = targets.filter((track) => track.path)
     if (!nativeTargets.length) return setNotice('IMPORT LOCAL TRACKS FIRST')
     const options = { mono, normalize, repair, repairMode, sampleRate: sampleRate === '44.1 kHz' ? 44100 : 48000 }
+    const totalTracks = nativeTargets.length
     setProcessing(true)
+    setProcessSession({
+      status: 'running',
+      stage: 'preparing',
+      trackIndex: 1,
+      totalTracks,
+      trackName: nativeTargets[0].name,
+      completed: 0,
+      failed: 0,
+      error: null,
+    })
     let completed = 0
     let failed = 0
-    for (const target of nativeTargets) {
+
+    for (let index = 0; index < nativeTargets.length; index += 1) {
+      const target = nativeTargets[index]
       setSelectedId(target.id)
       setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'working', progress: 0, error: null } : track))
+      setProcessSession((current) => ({
+        ...current,
+        status: 'running',
+        stage: 'preparing',
+        trackIndex: index + 1,
+        totalTracks,
+        trackName: target.name,
+        completed,
+        failed,
+        error: null,
+      }))
+      await paintNextFrame()
+
       try {
+        setProcessSession((current) => ({ ...current, stage: 'processing' }))
         const result = await processNativeAudio([target.path], options)
         if (!result.completed.length) throw new Error(result.errors[0] || 'Processing failed')
         const outputPath = result.completed[0].outputPath
-        const [metadataResult, waveform] = await Promise.all([analyzeNativePaths([outputPath]), getNativeWaveform(outputPath)])
+
+        setProcessSession((current) => ({ ...current, stage: 'analyzing' }))
+        const metadataResult = await analyzeNativePaths([outputPath])
         const outputMetadata = metadataResult.metadata[0]
+        if (!outputMetadata) throw new Error(metadataResult.errors[0] || 'Output analysis failed')
+
+        setProcessSession((current) => ({ ...current, stage: 'preview' }))
+        const waveform = await getNativeWaveform(outputPath)
+        if (!waveform?.peaks) throw new Error('Processed waveform could not be generated')
+
         completed += 1
-        setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'done', progress: 100, outputPath, outputWaveform: waveform?.peaks || null, outputChannels: outputMetadata?.channels || waveform?.channels || (mono ? 1 : track.channels), outputMetadata } : track))
+        setTracks((current) => current.map((track) => track.id === target.id ? {
+          ...track,
+          state: 'done',
+          progress: 100,
+          outputPath,
+          outputWaveform: waveform.peaks,
+          outputChannels: outputMetadata.channels || waveform.channels || (mono ? 1 : track.channels),
+          outputMetadata,
+        } : track))
+        setProcessSession((current) => ({ ...current, stage: 'complete', completed, failed, error: null }))
+        await paintNextFrame()
       } catch (error) {
+        const message = error.message || 'Processing failed'
         failed += 1
-        setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'error', progress: 0, error: error.message || 'Processing failed' } : track))
+        setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'error', progress: 0, error: message } : track))
+        setProcessSession((current) => ({ ...current, status: 'track-error', completed, failed, error: message }))
+        await paintNextFrame()
       }
     }
+
     setProcessing(false)
     if (completed) setAbMode('B')
+    setProcessSession((current) => ({
+      ...current,
+      status: failed ? (completed ? 'complete-with-errors' : 'error') : 'complete',
+      stage: failed && !completed ? current?.stage ?? 'preparing' : current?.stage === 'complete' ? 'complete' : current?.stage ?? 'complete',
+      trackIndex: totalTracks,
+      totalTracks,
+      trackName: failed && !completed ? current?.trackName ?? 'Processing failed' : failed ? 'Batch finished with errors' : 'All tracks are ready',
+      completed,
+      failed,
+      error: failed ? current?.error ?? `${failed} track${failed === 1 ? '' : 's'} failed` : null,
+    }))
     setNotice(`${completed} PROCESSED${failed ? ` · ${failed} FAILED` : ''}`)
   }
 
@@ -362,6 +514,7 @@ export function App() {
           <div className="analysis-row"><div className="analysis-title"><i /> MEASURED ANALYSIS</div><div><span>NOISE FLOOR</span><strong>—</strong></div><div><span>DYNAMIC RANGE</span><strong>—</strong></div><div><span>PEAK LEVEL</span><strong>{activeMetadata.truePeak ?? '—'}</strong></div><div><span>LOUDNESS RANGE</span><strong>—</strong></div><div><span>CREST FACTOR</span><strong>—</strong></div><div><span>CLIPPING</span><strong>—</strong></div></div>
         </section>
         <footer className="actionbar"><div className="project-info"><GearSix size={25} /><span>ENGINE <strong>{engineStatus.label}</strong></span><span>{tracks.length} TRACKS</span>{importing && <span className="busy-label">IMPORTING</span>}</div><button className="process-button secondary" type="button" onClick={() => processTracks(selected?.path ? [selected] : [])} disabled={processing || importing || !tracks.length}><DownloadSimple weight="bold" />PROCESS SELECTED</button><button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={() => processTracks(tracks)} disabled={processing || importing || !tracks.length}><DownloadSimple weight="bold" />{processing ? 'PROCESSING…' : 'PROCESS ALL'}</button></footer>
+        {processSession && <ProcessingModal session={processSession} onClose={() => { if (!processing) setProcessSession(null) }} />}
         {notice && <div className="notice" role="status">{notice}</div>}
       </div>
     </main>
