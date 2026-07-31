@@ -1,0 +1,32 @@
+name: Publish Validated V02 Source
+
+on:
+  pull_request:
+    branches:
+      - v02-trigger-base
+
+permissions:
+  contents: write
+
+jobs:
+  publish-source:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Generate the already validated V02 source
+        run: |
+          python .github/scripts/apply_v02.py
+          python .github/scripts/fix_v02_lint.py
+
+      - name: Publish source-only commit
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/App.jsx src/styles.css package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          git commit -m "feat: add truthful processing stages and release V02"
+          git push origin HEAD:validated/v02 --force
