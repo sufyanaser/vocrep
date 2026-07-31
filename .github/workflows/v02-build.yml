@@ -1,0 +1,355 @@
+name: Build NAS VocRep V02
+
+on:
+  push:
+    branches:
+      - feat/v02-processing-stages
+
+permissions:
+  contents: write
+
+jobs:
+  build-v02:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply truthful processing stages and V02 version
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import json
+          import re
+
+          app_path = Path("src/App.jsx")
+          app = app_path.read_text(encoding="utf-8")
+
+          modal_code = r'''
+          const PROCESS_STAGES = [
+            { id: 'preparing', label: 'PREPARING', detail: 'Validating track and output settings' },
+            { id: 'processing', label: 'PROCESSING AUDIO', detail: 'Running the selected audio operations' },
+            { id: 'analyzing', label: 'ANALYZING OUTPUT', detail: 'Reading metadata, LUFS, and True Peak' },
+            { id: 'preview', label: 'BUILDING PREVIEW', detail: 'Generating the processed waveform' },
+            { id: 'complete', label: 'COMPLETE', detail: 'Output is ready for A/B preview' },
+          ]
+
+          const FINAL_PROCESS_STATUSES = new Set(['complete', 'complete-with-errors', 'error'])
+
+          function paintNextFrame() {
+            return new Promise((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(resolve)))
+          }
+
+          function ProcessingModal({ session, onClose }) {
+            const currentIndex = Math.max(0, PROCESS_STAGES.findIndex((stage) => stage.id === session.stage))
+            const isFinal = FINAL_PROCESS_STATUSES.has(session.status)
+            const remaining = Math.max(0, session.totalTracks - session.completed - session.failed)
+            const title = session.status === 'complete'
+              ? 'PROCESSING COMPLETE'
+              : session.status === 'error'
+                ? 'PROCESSING FAILED'
+                : session.status === 'complete-with-errors'
+                  ? 'COMPLETE WITH ERRORS'
+                  : 'PROCESSING TRACKS'
+
+            return (
+              <div className="processing-overlay" role="dialog" aria-modal="true" aria-labelledby="processing-title">
+                <section className={`processing-modal status-${session.status}`} aria-live="polite">
+                  <header className="processing-header">
+                    <div>
+                      <span className="processing-kicker">NAS VOCREP V02</span>
+                      <h2 id="processing-title">{title}</h2>
+                    </div>
+                    <span className="processing-counter">TRACK {session.trackIndex} / {session.totalTracks}</span>
+                  </header>
+
+                  <div className="processing-track">
+                    <span>CURRENT TRACK</span>
+                    <strong title={session.trackName}>{session.trackName}</strong>
+                  </div>
+
+                  <ol className="processing-stages">
+                    {PROCESS_STAGES.map((stage, index) => {
+                      const isDone = session.stage === 'complete' || index < currentIndex
+                      const isError = Boolean(session.error)
+                        && ['track-error', 'error', 'complete-with-errors'].includes(session.status)
+                        && index === currentIndex
+                        && session.stage !== 'complete'
+                      const isActive = !isFinal && !isError && index === currentIndex
+                      const stateClass = isDone ? 'is-done' : isError ? 'is-error' : isActive ? 'is-active' : 'is-pending'
+                      return (
+                        <li className={stateClass} key={stage.id}>
+                          <span className="stage-marker">
+                            {isDone ? <Check weight="bold" /> : isError ? <X weight="bold" /> : isActive ? <i /> : <b>{index + 1}</b>}
+                          </span>
+                          <span className="stage-copy">
+                            <strong>{stage.label}</strong>
+                            <small>{stage.detail}</small>
+                          </span>
+                        </li>
+                      )
+                    })}
+                  </ol>
+
+                  <div className="processing-totals">
+                    <div><span>COMPLETED</span><strong>{session.completed}</strong></div>
+                    <div><span>FAILED</span><strong className={session.failed ? 'has-failures' : ''}>{session.failed}</strong></div>
+                    <div><span>REMAINING</span><strong>{remaining}</strong></div>
+                  </div>
+
+                  {session.error && <div className="processing-error" role="alert">{session.error}</div>}
+
+                  {isFinal && (
+                    <button className="processing-close" type="button" onClick={onClose}>
+                      CLOSE
+                    </button>
+                  )}
+                </section>
+              </div>
+            )
+          }
+          '''.strip()
+
+          if "const PROCESS_STAGES = [" not in app:
+              app = app.replace("export function App() {", modal_code + "\n\nexport function App() {", 1)
+
+          app = app.replace(
+              "  const [processing, setProcessing] = useState(false)\n",
+              "  const [processing, setProcessing] = useState(false)\n  const [processSession, setProcessSession] = useState(null)\n",
+              1,
+          )
+
+          new_process = r'''  const processTracks = async (targets) => {
+            if (processing) return
+            if (!engineStatus.ready) return setNotice('FFMPEG ENGINE IS NOT READY')
+            const nativeTargets = targets.filter((track) => track.path)
+            if (!nativeTargets.length) return setNotice('IMPORT LOCAL TRACKS FIRST')
+            const options = { mono, normalize, repair, repairMode, sampleRate: sampleRate === '44.1 kHz' ? 44100 : 48000 }
+            const totalTracks = nativeTargets.length
+            setProcessing(true)
+            setProcessSession({
+              status: 'running',
+              stage: 'preparing',
+              trackIndex: 1,
+              totalTracks,
+              trackName: nativeTargets[0].name,
+              completed: 0,
+              failed: 0,
+              error: null,
+            })
+            let completed = 0
+            let failed = 0
+
+            for (let index = 0; index < nativeTargets.length; index += 1) {
+              const target = nativeTargets[index]
+              setSelectedId(target.id)
+              setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'working', progress: 0, error: null } : track))
+              setProcessSession((current) => ({
+                ...current,
+                status: 'running',
+                stage: 'preparing',
+                trackIndex: index + 1,
+                totalTracks,
+                trackName: target.name,
+                completed,
+                failed,
+                error: null,
+              }))
+              await paintNextFrame()
+
+              try {
+                setProcessSession((current) => ({ ...current, stage: 'processing' }))
+                const result = await processNativeAudio([target.path], options)
+                if (!result.completed.length) throw new Error(result.errors[0] || 'Processing failed')
+                const outputPath = result.completed[0].outputPath
+
+                setProcessSession((current) => ({ ...current, stage: 'analyzing' }))
+                const metadataResult = await analyzeNativePaths([outputPath])
+                const outputMetadata = metadataResult.metadata[0]
+                if (!outputMetadata) throw new Error(metadataResult.errors[0] || 'Output analysis failed')
+
+                setProcessSession((current) => ({ ...current, stage: 'preview' }))
+                const waveform = await getNativeWaveform(outputPath)
+                if (!waveform?.peaks) throw new Error('Processed waveform could not be generated')
+
+                completed += 1
+                setTracks((current) => current.map((track) => track.id === target.id ? {
+                  ...track,
+                  state: 'done',
+                  progress: 100,
+                  outputPath,
+                  outputWaveform: waveform.peaks,
+                  outputChannels: outputMetadata.channels || waveform.channels || (mono ? 1 : track.channels),
+                  outputMetadata,
+                } : track))
+                setProcessSession((current) => ({ ...current, stage: 'complete', completed, failed, error: null }))
+                await paintNextFrame()
+              } catch (error) {
+                const message = error.message || 'Processing failed'
+                failed += 1
+                setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'error', progress: 0, error: message } : track))
+                setProcessSession((current) => ({ ...current, status: 'track-error', completed, failed, error: message }))
+                await paintNextFrame()
+              }
+            }
+
+            setProcessing(false)
+            if (completed) setAbMode('B')
+            setProcessSession((current) => ({
+              ...current,
+              status: failed ? (completed ? 'complete-with-errors' : 'error') : 'complete',
+              stage: failed && !completed ? current?.stage ?? 'preparing' : current?.stage === 'complete' ? 'complete' : current?.stage ?? 'complete',
+              trackIndex: totalTracks,
+              totalTracks,
+              trackName: failed && !completed ? current?.trackName ?? 'Processing failed' : failed ? 'Batch finished with errors' : 'All tracks are ready',
+              completed,
+              failed,
+              error: failed ? current?.error ?? `${failed} track${failed === 1 ? '' : 's'} failed` : null,
+            }))
+            setNotice(`${completed} PROCESSED${failed ? ` · ${failed} FAILED` : ''}`)
+          }'''
+
+          process_pattern = re.compile(r"  const processTracks = async \(targets\) => \{.*?\n  \}\n\n  return \(", re.S)
+          app, count = process_pattern.subn(new_process + "\n\n  return (", app, count=1)
+          if count != 1:
+              raise RuntimeError("Unable to replace processTracks")
+
+          modal_mount = "        {processSession && <ProcessingModal session={processSession} onClose={() => { if (!processing) setProcessSession(null) }} />}\n"
+          notice_mount = "        {notice && <div className=\"notice\" role=\"status\">{notice}</div>}"
+          if modal_mount.strip() not in app:
+              app = app.replace(notice_mount, modal_mount + notice_mount, 1)
+
+          app_path.write_text(app, encoding="utf-8")
+
+          styles_path = Path("src/styles.css")
+          styles = styles_path.read_text(encoding="utf-8")
+          modal_styles = r'''
+
+          .processing-overlay { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 32px; background: rgba(3,5,6,.78); backdrop-filter: blur(5px); animation: processing-overlay-in .16s ease-out; }
+          .processing-modal { width: min(720px, calc(100vw - 64px)); border: 1px solid rgba(255,255,255,.14); border-radius: 8px; overflow: hidden; background: #0d1113; box-shadow: 0 28px 90px rgba(0,0,0,.62); animation: processing-modal-in .2s ease-out; }
+          .processing-header { min-height: 94px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 22px 26px; border-bottom: 1px solid var(--line); background: #0a0d0f; }
+          .processing-kicker { color: var(--orange); font-size: 10px; font-weight: 700; letter-spacing: .16em; }
+          .processing-header h2 { margin: 7px 0 0; color: #f0f1f1; font-size: 22px; font-weight: 650; letter-spacing: .01em; }
+          .processing-counter { flex: 0 0 auto; padding: 8px 11px; border: 1px solid rgba(255,152,15,.35); border-radius: 4px; color: #ffb54a; background: rgba(255,152,15,.055); font-size: 11px; font-weight: 650; letter-spacing: .06em; }
+          .processing-track { display: flex; flex-direction: column; gap: 7px; padding: 17px 26px; border-bottom: 1px solid rgba(255,255,255,.07); background: #101416; }
+          .processing-track span { color: #747b80; font-size: 9px; font-weight: 650; letter-spacing: .13em; }
+          .processing-track strong { overflow: hidden; color: #dedfe0; font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+          .processing-stages { list-style: none; display: grid; gap: 0; margin: 0; padding: 16px 26px 10px; }
+          .processing-stages li { position: relative; min-height: 63px; display: grid; grid-template-columns: 34px minmax(0,1fr); align-items: start; gap: 14px; color: #777e82; }
+          .processing-stages li:not(:last-child)::after { content: ''; position: absolute; left: 16px; top: 35px; bottom: -4px; width: 1px; background: rgba(255,255,255,.12); }
+          .processing-stages li.is-done:not(:last-child)::after { background: rgba(34,195,75,.52); }
+          .stage-marker { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.14); border-radius: 50%; background: #121719; color: #7d8589; font-size: 11px; font-variant-numeric: tabular-nums; z-index: 1; }
+          .stage-marker svg { width: 15px; height: 15px; }
+          .stage-marker i { width: 14px; height: 14px; border: 2px solid rgba(255,152,15,.22); border-top-color: var(--orange); border-right-color: var(--orange); border-radius: 50%; animation: spin .85s linear infinite; }
+          .processing-stages li.is-active .stage-marker { border-color: var(--orange); color: var(--orange); background: rgba(255,152,15,.07); box-shadow: 0 0 0 4px rgba(255,152,15,.045); }
+          .processing-stages li.is-done .stage-marker { border-color: var(--green); color: var(--green); background: rgba(34,195,75,.065); }
+          .processing-stages li.is-error .stage-marker { border-color: #ff6652; color: #ff6652; background: rgba(255,82,65,.07); }
+          .stage-copy { min-width: 0; display: flex; flex-direction: column; gap: 6px; padding-top: 1px; }
+          .stage-copy strong { color: #8c9397; font-size: 12px; font-weight: 650; letter-spacing: .04em; }
+          .stage-copy small { color: #666d71; font-size: 10px; line-height: 1.45; }
+          .processing-stages li.is-active .stage-copy strong { color: #ffb54a; }
+          .processing-stages li.is-done .stage-copy strong { color: #b9d9c1; }
+          .processing-stages li.is-error .stage-copy strong { color: #ff7b68; }
+          .processing-totals { display: grid; grid-template-columns: repeat(3,1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #0a0d0f; }
+          .processing-totals > div { min-height: 70px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; border-right: 1px solid var(--line); }
+          .processing-totals > div:last-child { border-right: 0; }
+          .processing-totals span { color: #747b80; font-size: 9px; font-weight: 650; letter-spacing: .1em; }
+          .processing-totals strong { color: #d9dbdc; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+          .processing-totals .has-failures { color: #ff725e; }
+          .processing-error { margin: 18px 26px 0; padding: 12px 14px; border: 1px solid rgba(255,91,70,.35); border-radius: 4px; color: #ff9686; background: rgba(255,75,55,.06); font-size: 11px; line-height: 1.5; }
+          .processing-close { width: calc(100% - 52px); height: 48px; margin: 20px 26px 24px; border: 1px solid rgba(255,152,15,.68); border-radius: 4px; color: #111; background: var(--orange); font-size: 13px; font-weight: 700; letter-spacing: .08em; cursor: pointer; }
+          .processing-close:hover { filter: brightness(1.08); }
+          .status-complete .processing-header h2 { color: #aee4b9; }
+          .status-error .processing-header h2, .status-complete-with-errors .processing-header h2 { color: #ff8d7b; }
+
+          @keyframes processing-overlay-in { from { opacity: 0; } }
+          @keyframes processing-modal-in { from { opacity: 0; transform: translateY(10px) scale(.99); } }
+          '''.strip()
+          if ".processing-overlay" not in styles:
+              styles += "\n\n" + modal_styles + "\n"
+          styles_path.write_text(styles, encoding="utf-8")
+
+          package_path = Path("package.json")
+          package = json.loads(package_path.read_text(encoding="utf-8"))
+          package["version"] = "0.2.0"
+          package_path.write_text(json.dumps(package, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+          lock_path = Path("package-lock.json")
+          lock_text = lock_path.read_text(encoding="utf-8")
+          lock_text = lock_text.replace('"version": "0.0.0"', '"version": "0.2.0"', 2)
+          lock_path.write_text(lock_text, encoding="utf-8")
+
+          tauri_path = Path("src-tauri/tauri.conf.json")
+          tauri = json.loads(tauri_path.read_text(encoding="utf-8"))
+          tauri["version"] = "0.2.0"
+          tauri_path.write_text(json.dumps(tauri, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+          cargo_path = Path("src-tauri/Cargo.toml")
+          cargo = cargo_path.read_text(encoding="utf-8")
+          cargo = cargo.replace('version = "0.1.0"', 'version = "0.2.0"', 1)
+          cargo_path.write_text(cargo, encoding="utf-8")
+
+          installer_workflow_path = Path(".github/workflows/windows-installer.yml")
+          installer_workflow = installer_workflow_path.read_text(encoding="utf-8")
+          if "Rename installer to V02" not in installer_workflow:
+              installer_workflow = installer_workflow.replace(
+                  "      - run: npm run tauri:build\n      - uses: actions/upload-artifact@v4",
+                  "      - run: npm run tauri:build\n      - name: Rename installer to V02\n        shell: pwsh\n        run: |\n          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*.exe' | Select-Object -First 1\n          if (-not $installer) { throw 'NSIS installer was not produced' }\n          Copy-Item $installer.FullName 'src-tauri/target/release/bundle/nsis/NAS VocRep Setup V02.exe' -Force\n      - uses: actions/upload-artifact@v4",
+                  1,
+              )
+              installer_workflow = installer_workflow.replace(
+                  "          name: NAS-VocRep-Windows-Installer\n          path: src-tauri/target/release/bundle/nsis/*.exe",
+                  "          name: NAS-VocRep-Setup-V02\n          path: src-tauri/target/release/bundle/nsis/NAS VocRep Setup V02.exe",
+                  1,
+              )
+          installer_workflow_path.write_text(installer_workflow, encoding="utf-8")
+          '@ | Set-Content "$env:RUNNER_TEMP/apply_v02.py" -Encoding utf8
+          python "$env:RUNNER_TEMP/apply_v02.py"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Windows NSIS build
+        run: npm run tauri:build
+
+      - name: Rename installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | Where-Object { $_.Name -ne "NAS VocRep Setup V02.exe" } | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer was not produced" }
+          Copy-Item $installer.FullName "src-tauri/target/release/bundle/nsis/NAS VocRep Setup V02.exe" -Force
+
+      - name: Commit validated V02 source
+        shell: pwsh
+        run: |
+          Remove-Item ".github/workflows/v02-build.yml" -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/App.jsx src/styles.css package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml .github/workflows/windows-installer.yml .github/workflows/v02-build.yml
+          git commit -m "feat: add truthful processing stages and release V02"
+          git push origin HEAD:feat/v02-processing-stages
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NAS-VocRep-Setup-V02
+          path: src-tauri/target/release/bundle/nsis/NAS VocRep Setup V02.exe
+          if-no-files-found: error
