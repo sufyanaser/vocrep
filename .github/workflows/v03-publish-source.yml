@@ -44,17 +44,36 @@ jobs:
       - name: Apply already validated V03 source
         run: python .github/scripts/apply_v03.py
 
-      - name: Publish clean source branch
+      - name: Publish source-only branch from develop
         shell: pwsh
         run: |
-          Remove-Item ".github/workflows/v03-build.yml" -Force -ErrorAction SilentlyContinue
-          Remove-Item ".github/workflows/v03-publish-source.yml" -Force
-          Remove-Item ".github/scripts/apply_v03.py" -Force
-          Remove-Item ".github/v03_chunks" -Recurse -Force
-          Remove-Item ".github/v03_payload" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item ".github/v03-trigger.txt" -Force -ErrorAction SilentlyContinue
+          $stage = Join-Path $env:RUNNER_TEMP "V03-publish"
+          New-Item $stage -ItemType Directory -Force | Out-Null
+          $files = @(
+            "src/App.jsx",
+            "src/styles.css",
+            "src/lib/audioFiles.js",
+            "src-tauri/src/lib.rs",
+            "package.json",
+            "package-lock.json",
+            "src-tauri/Cargo.toml",
+            "src-tauri/tauri.conf.json"
+          )
+          foreach ($file in $files) {
+            $destination = Join-Path $stage $file
+            New-Item (Split-Path $destination) -ItemType Directory -Force | Out-Null
+            Copy-Item $file $destination -Force
+          }
+
+          git checkout -B validated-v03 origin/develop
+          foreach ($file in $files) {
+            $source = Join-Path $stage $file
+            New-Item (Split-Path $file) -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+            Copy-Item $source $file -Force
+          }
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add -- $files
           git commit -m "feat: complete VocRep tools and release V03"
           git push origin HEAD:validated/v03 --force
