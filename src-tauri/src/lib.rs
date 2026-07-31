@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use tauri::Emitter;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -71,8 +72,9 @@ fn check_audio_engine() -> AudioEngineStatus {
             error: Some(error),
         };
     }
+
     let filters_output = hidden_command("ffmpeg")
-        .args(["-hide_banner", "-filters"])
+        .args(["-hide_banner", "-nostdin", "-filters"])
         .output();
     let filters = match filters_output {
         Ok(output) if output.status.success() => {
@@ -89,12 +91,14 @@ fn check_audio_engine() -> AudioEngineStatus {
             }
         }
     };
-    let required = ["adeclick", "afftdn", "loudnorm"];
+
+    let required = ["adeclick", "afftdn", "loudnorm", "pan"];
     let missing_filters = required
         .iter()
         .filter(|name| !filters.contains(*name))
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
+
     AudioEngineStatus {
         ready: missing_filters.is_empty(),
         ffmpeg_version: ffmpeg_version.ok(),
@@ -190,7 +194,14 @@ fn metadata_from_ffprobe(path: &str, payload: &Value) -> Result<AudioMetadata, S
     })
 }
 
-fn analyze_loudness(path: &str) -> Result<(f64, f64), String> {
+fn parse_loudness_value(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|number| number.is_finite())
+}
+
+fn analyze_loudness(path: &str) -> Result<(Option<f64>, Option<f64>), String> {
     let output = hidden_command("ffmpeg")
         .args([
             "-hide_banner",
@@ -215,10 +226,8 @@ fn analyze_loudness(path: &str) -> Result<(f64, f64), String> {
         .ok_or_else(|| "Loudness JSON is incomplete".to_string())?;
     let payload: Value = serde_json::from_str(&stderr[start..=end])
         .map_err(|error| format!("Invalid loudness response: {error}"))?;
-    let integrated = parse_number::<f64>(payload.get("input_i"))
-        .ok_or_else(|| "Integrated LUFS missing".to_string())?;
-    let true_peak = parse_number::<f64>(payload.get("input_tp"))
-        .ok_or_else(|| "True peak missing".to_string())?;
+    let integrated = parse_loudness_value(payload.get("input_i"));
+    let true_peak = parse_loudness_value(payload.get("input_tp"));
     Ok((integrated, true_peak))
 }
 
@@ -259,15 +268,20 @@ fn is_processed_output(path: &str) -> bool {
     })
 }
 
-fn probe_audio_path(path: &str) -> Result<AudioMetadata, String> {
+fn analyze_processed_output(path: &str) -> Result<AudioMetadata, String> {
     let mut metadata = probe_audio_metadata(path)?;
-    if is_processed_output(path) {
-        if let Ok((integrated_lufs, true_peak_dbtp)) = analyze_loudness(path) {
-            metadata.integrated_lufs = Some(integrated_lufs);
-            metadata.true_peak_dbtp = Some(true_peak_dbtp);
-        }
-    }
+    let (integrated_lufs, true_peak_dbtp) = analyze_loudness(path)?;
+    metadata.integrated_lufs = integrated_lufs;
+    metadata.true_peak_dbtp = true_peak_dbtp;
     Ok(metadata)
+}
+
+fn probe_audio_path(path: &str) -> Result<AudioMetadata, String> {
+    if is_processed_output(path) {
+        analyze_processed_output(path)
+    } else {
+        probe_audio_metadata(path)
+    }
 }
 
 #[tauri::command]
@@ -281,18 +295,12 @@ fn probe_audio_files(paths: Vec<String>) -> Vec<Result<AudioMetadata, String>> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessOptions {
-    pub mono: bool,
+    pub channel_mode: String,
     pub normalize: bool,
-    pub repair: bool,
-    pub repair_mode: String,
+    pub de_click_mode: String,
+    pub noise_cleanup_mode: String,
     pub sample_rate: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProcessResult {
-    pub input_path: String,
-    pub output_path: String,
+    pub output_depth: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +308,43 @@ pub struct ProcessResult {
 pub struct WaveformData {
     pub channels: u32,
     pub peaks: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessedTrackResult {
+    pub input_path: String,
+    pub output_path: String,
+    pub output_folder: String,
+    pub metadata: AudioMetadata,
+    pub waveform: WaveformData,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessingStageEvent {
+    job_id: String,
+    stage: String,
+    status: String,
+    message: Option<String>,
+}
+
+fn emit_stage(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    stage: &str,
+    status: &str,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        "vocrep://processing-stage",
+        ProcessingStageEvent {
+            job_id: job_id.to_string(),
+            stage: stage.to_string(),
+            status: status.to_string(),
+            message,
+        },
+    );
 }
 
 fn waveform_from_pcm(bytes: &[u8], channels: usize, points: usize) -> WaveformData {
@@ -372,6 +417,52 @@ fn get_audio_waveform(path: String, points: usize) -> Result<WaveformData, Strin
     extract_waveform(&path, points.clamp(128, 2048))
 }
 
+fn normalized_mode(mode: &str) -> String {
+    mode.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !matches!(character, ' ' | '-'))
+        .collect()
+}
+
+fn channel_suffix(mode: &str) -> Result<&'static str, String> {
+    match normalized_mode(mode).as_str() {
+        "keepstereo" => Ok(""),
+        "monosum" => Ok("_Mono"),
+        "leftchannel" => Ok("_Left"),
+        "rightchannel" => Ok("_Right"),
+        _ => Err("Channel mode must be Keep Stereo, Mono Sum, Left Channel, or Right Channel".to_string()),
+    }
+}
+
+fn de_click_filter(mode: &str) -> Result<Option<&'static str>, String> {
+    match normalized_mode(mode).as_str() {
+        "off" => Ok(None),
+        "light" => Ok(Some("adeclick=w=40:o=70:a=2:t=2")),
+        "balanced" => Ok(Some("adeclick=w=55:o=75:a=2:t=2")),
+        "strong" => Ok(Some("adeclick=w=70:o=80:a=2:t=2")),
+        _ => Err("De-Click mode must be Off, Light, Balanced, or Strong".to_string()),
+    }
+}
+
+fn noise_cleanup_filter(mode: &str) -> Result<Option<&'static str>, String> {
+    match normalized_mode(mode).as_str() {
+        "off" => Ok(None),
+        "light" => Ok(Some("afftdn=nf=-38:nr=5:tn=1")),
+        "balanced" => Ok(Some("afftdn=nf=-34:nr=9:tn=1")),
+        "strong" => Ok(Some("afftdn=nf=-30:nr=14:tn=1")),
+        _ => Err("Noise Cleanup mode must be Off, Light, Balanced, or Strong".to_string()),
+    }
+}
+
+fn output_codec(depth: u32) -> Result<&'static str, String> {
+    match depth {
+        24 => Ok("pcm_s24le"),
+        32 => Ok("pcm_f32le"),
+        _ => Err("Output depth must be 24 or 32".to_string()),
+    }
+}
+
 fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, String> {
     let parent = input
         .parent()
@@ -383,33 +474,41 @@ fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, St
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("track");
-    let channel = if options.mono { "_Mono" } else { "" };
-    let rate = if options.sample_rate == 44_100 {
-        "_44k"
-    } else {
-        "_48k"
-    };
-    Ok(output_dir.join(format!("{stem}_Ready{channel}{rate}.wav")))
+    let channel = channel_suffix(&options.channel_mode)?;
+    let rate = if options.sample_rate == 44_100 { "_44k" } else { "_48k" };
+    let depth = if options.output_depth == 32 { "_32f" } else { "_24b" };
+    Ok(output_dir.join(format!("{stem}_Ready{channel}{rate}{depth}.wav")))
 }
 
-fn repair_filter(mode: &str) -> Result<&'static str, String> {
-    match mode.to_ascii_lowercase().as_str() {
-        "light" => Ok("adeclick=w=40:o=70:a=2:t=2,afftdn=nf=-38:nr=5:tn=1"),
-        "balanced" => Ok("adeclick=w=55:o=75:a=2:t=2,afftdn=nf=-34:nr=9:tn=1"),
-        "strong" => Ok("adeclick=w=70:o=80:a=2:t=2,afftdn=nf=-30:nr=14:tn=1"),
-        _ => Err("Repair mode must be Light, Balanced, or Strong".to_string()),
-    }
-}
-
-fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessResult, String> {
+fn prepare_processing(path: &str, options: &ProcessOptions) -> Result<(PathBuf, PathBuf, u32), String> {
     if options.sample_rate != 44_100 && options.sample_rate != 48_000 {
         return Err("Sample rate must be 44100 or 48000".to_string());
     }
-    let input = Path::new(path);
+    output_codec(options.output_depth)?;
+    channel_suffix(&options.channel_mode)?;
+    de_click_filter(&options.de_click_mode)?;
+    noise_cleanup_filter(&options.noise_cleanup_mode)?;
+
+    let input = PathBuf::from(path);
     if !input.is_file() {
         return Err(format!("Audio file not found: {path}"));
     }
-    let output_path = output_path_for(input, options)?;
+    let metadata = probe_audio_metadata(path)?;
+    if normalized_mode(&options.channel_mode) == "rightchannel" && metadata.channels < 2 {
+        return Err("Right Channel requires a stereo or multichannel source".to_string());
+    }
+    let output = output_path_for(&input, options)?;
+    Ok((input, output, metadata.channels))
+}
+
+fn run_processing(
+    input: &Path,
+    output: &Path,
+    options: &ProcessOptions,
+    input_channels: u32,
+) -> Result<(), String> {
+    let input_path = input.to_string_lossy();
+    let output_path = output.to_string_lossy();
     let mut command = hidden_command("ffmpeg");
     command.args([
         "-hide_banner",
@@ -418,15 +517,21 @@ fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessRes
         "error",
         "-y",
         "-i",
-        path,
+        input_path.as_ref(),
         "-vn",
     ]);
-    if options.mono {
-        command.args(["-ac", "1"]);
-    }
+
     let mut filters = Vec::new();
-    if options.repair {
-        filters.push(repair_filter(&options.repair_mode)?.to_string());
+    match normalized_mode(&options.channel_mode).as_str() {
+        "leftchannel" => filters.push("pan=mono|c0=c0".to_string()),
+        "rightchannel" => filters.push("pan=mono|c0=c1".to_string()),
+        _ => {}
+    }
+    if let Some(filter) = de_click_filter(&options.de_click_mode)? {
+        filters.push(filter.to_string());
+    }
+    if let Some(filter) = noise_cleanup_filter(&options.noise_cleanup_mode)? {
+        filters.push(filter.to_string());
     }
     if options.normalize {
         filters.push("loudnorm=I=-18:TP=-1.0:LRA=11".to_string());
@@ -434,13 +539,19 @@ fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessRes
     if !filters.is_empty() {
         command.args(["-af", &filters.join(",")]);
     }
+
+    if normalized_mode(&options.channel_mode) == "monosum" && input_channels > 1 {
+        command.args(["-ac", "1"]);
+    }
+
     command.args([
         "-ar",
         &options.sample_rate.to_string(),
         "-c:a",
-        "pcm_s24le",
-        output_path.to_string_lossy().as_ref(),
+        output_codec(options.output_depth)?,
+        output_path.as_ref(),
     ]);
+
     let result = command
         .output()
         .map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
@@ -452,21 +563,99 @@ fn process_audio_path(path: &str, options: &ProcessOptions) -> Result<ProcessRes
             message
         });
     }
-    Ok(ProcessResult {
-        input_path: path.to_string(),
-        output_path: output_path.to_string_lossy().to_string(),
+    Ok(())
+}
+
+fn process_audio_track_blocking(
+    app: tauri::AppHandle,
+    job_id: String,
+    path: String,
+    options: ProcessOptions,
+) -> Result<ProcessedTrackResult, String> {
+    emit_stage(&app, &job_id, "preparing", "active", None);
+    let (input, output, input_channels) = match prepare_processing(&path, &options) {
+        Ok(value) => value,
+        Err(error) => {
+            emit_stage(&app, &job_id, "preparing", "error", Some(error.clone()));
+            return Err(error);
+        }
+    };
+    emit_stage(&app, &job_id, "preparing", "done", None);
+
+    emit_stage(&app, &job_id, "processing", "active", None);
+    if let Err(error) = run_processing(&input, &output, &options, input_channels) {
+        emit_stage(&app, &job_id, "processing", "error", Some(error.clone()));
+        return Err(error);
+    }
+    emit_stage(&app, &job_id, "processing", "done", None);
+
+    let output_path = output.to_string_lossy().to_string();
+    emit_stage(&app, &job_id, "analyzing", "active", None);
+    let metadata = match analyze_processed_output(&output_path) {
+        Ok(value) => value,
+        Err(error) => {
+            emit_stage(&app, &job_id, "analyzing", "error", Some(error.clone()));
+            return Err(error);
+        }
+    };
+    emit_stage(&app, &job_id, "analyzing", "done", None);
+
+    emit_stage(&app, &job_id, "preview", "active", None);
+    let waveform = match extract_waveform(&output_path, 900) {
+        Ok(value) => value,
+        Err(error) => {
+            emit_stage(&app, &job_id, "preview", "error", Some(error.clone()));
+            return Err(error);
+        }
+    };
+    emit_stage(&app, &job_id, "preview", "done", None);
+    emit_stage(&app, &job_id, "complete", "done", None);
+
+    let output_folder = output
+        .parent()
+        .map(|folder| folder.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    Ok(ProcessedTrackResult {
+        input_path: path,
+        output_path,
+        output_folder,
+        metadata,
+        waveform,
     })
 }
 
 #[tauri::command]
-fn process_audio_files(
-    paths: Vec<String>,
+async fn process_audio_track(
+    app: tauri::AppHandle,
+    job_id: String,
+    path: String,
     options: ProcessOptions,
-) -> Vec<Result<ProcessResult, String>> {
-    paths
-        .into_iter()
-        .map(|path| process_audio_path(&path, &options))
-        .collect()
+) -> Result<ProcessedTrackResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        process_audio_track_blocking(app, job_id, path, options)
+    })
+    .await
+    .map_err(|error| format!("Processing task failed: {error}"))?
+}
+
+#[tauri::command]
+fn open_output_folder(folder_path: String) -> Result<(), String> {
+    let folder = PathBuf::from(&folder_path);
+    if !folder.is_dir() {
+        return Err(format!("Output folder not found: {folder_path}"));
+    }
+
+    #[cfg(windows)]
+    let result = hidden_command("explorer.exe").arg(&folder).spawn();
+    #[cfg(target_os = "macos")]
+    let result = hidden_command("open").arg(&folder).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = hidden_command("xdg-open").arg(&folder).spawn();
+
+    result
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open output folder: {error}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -477,7 +666,8 @@ pub fn run() {
             check_audio_engine,
             probe_audio_files,
             get_audio_waveform,
-            process_audio_files
+            process_audio_track,
+            open_output_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running NAS VocRep");
@@ -487,11 +677,22 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn test_options() -> ProcessOptions {
+        ProcessOptions {
+            channel_mode: "Mono Sum".to_string(),
+            normalize: true,
+            de_click_mode: "Balanced".to_string(),
+            noise_cleanup_mode: "Light".to_string(),
+            sample_rate: 48_000,
+            output_depth: 32,
+        }
+    }
+
     #[test]
     fn parses_loudness_numbers() {
         let payload = serde_json::json!({ "input_i": "-17.82", "input_tp": "-1.14" });
-        assert_eq!(parse_number::<f64>(payload.get("input_i")), Some(-17.82));
-        assert_eq!(parse_number::<f64>(payload.get("input_tp")), Some(-1.14));
+        assert_eq!(parse_loudness_value(payload.get("input_i")), Some(-17.82));
+        assert_eq!(parse_loudness_value(payload.get("input_tp")), Some(-1.14));
     }
 
     #[test]
@@ -502,24 +703,24 @@ mod tests {
     }
 
     #[test]
-    fn resolves_repair_profiles() {
-        assert!(repair_filter("Light").unwrap().contains("nr=5"));
-        assert!(repair_filter("Balanced").unwrap().contains("nr=9"));
-        assert!(repair_filter("Strong").unwrap().contains("nr=14"));
-        assert!(repair_filter("Extreme").is_err());
+    fn resolves_independent_cleanup_profiles() {
+        assert!(de_click_filter("Off").unwrap().is_none());
+        assert!(de_click_filter("Balanced").unwrap().unwrap().contains("adeclick"));
+        assert!(noise_cleanup_filter("Light").unwrap().unwrap().contains("nr=5"));
+        assert!(noise_cleanup_filter("Strong").unwrap().unwrap().contains("nr=14"));
+    }
+
+    #[test]
+    fn resolves_output_codecs() {
+        assert_eq!(output_codec(24).unwrap(), "pcm_s24le");
+        assert_eq!(output_codec(32).unwrap(), "pcm_f32le");
+        assert!(output_codec(16).is_err());
     }
 
     #[test]
     fn creates_cubase_ready_output_name() {
-        let options = ProcessOptions {
-            mono: true,
-            normalize: true,
-            repair: true,
-            repair_mode: "Balanced".to_string(),
-            sample_rate: 48_000,
-        };
-        let output = output_path_for(Path::new("/tmp/Song01 Vocal.wav"), &options).unwrap();
-        assert!(output.ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k.wav"));
+        let output = output_path_for(Path::new("/tmp/Song01 Vocal.wav"), &test_options()).unwrap();
+        assert!(output.ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k_32f.wav"));
     }
 
     #[test]

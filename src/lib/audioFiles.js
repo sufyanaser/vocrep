@@ -88,6 +88,18 @@ async function decodeBrowserFile(file) {
   }
 }
 
+function collectResults(results, paths) {
+  const metadata = []
+  const errors = []
+  results.forEach((result, index) => {
+    if (result?.Ok) metadata.push(result.Ok)
+    else if (result?.ok) metadata.push(result.ok)
+    else if (result?.Err || result?.err) errors.push(`${paths[index]}: ${result.Err ?? result.err}`)
+    else if (result?.name) metadata.push(result)
+  })
+  return { metadata, errors }
+}
+
 export async function getNativeWaveform(path, points = 900) {
   if (!isTauriRuntime() || !path) return null
   const { invoke } = await import('@tauri-apps/api/core')
@@ -123,15 +135,7 @@ export async function analyzeNativePaths(paths) {
   if (!paths?.length) return { metadata: [], errors: [] }
   const { invoke } = await import('@tauri-apps/api/core')
   const results = await invoke('probe_audio_files', { paths })
-  const metadata = []
-  const errors = []
-  results.forEach((result, index) => {
-    if (result?.Ok) metadata.push(result.Ok)
-    else if (result?.ok) metadata.push(result.ok)
-    else if (result?.Err || result?.err) errors.push(`${paths[index]}: ${result.Err ?? result.err}`)
-    else if (result?.name) metadata.push(result)
-  })
-  return { metadata, errors }
+  return collectResults(results, paths)
 }
 
 export async function listenForNativeDrop(onPaths) {
@@ -142,24 +146,25 @@ export async function listenForNativeDrop(onPaths) {
   })
 }
 
-
-export async function processNativeAudio(paths, options) {
-  if (!isTauriRuntime()) throw new Error('Audio processing requires the desktop app')
-  if (!paths?.length) throw new Error('Import a local audio file first')
-  const { invoke } = await import('@tauri-apps/api/core')
-  const results = await invoke('process_audio_files', { paths, options })
-  const completed = []
-  const errors = []
-  results.forEach((result, index) => {
-    if (result?.Ok) completed.push(result.Ok)
-    else if (result?.ok) completed.push(result.ok)
-    else if (result?.Err || result?.err) errors.push(result.Err ?? result.err)
-    else if (result?.outputPath) completed.push(result)
-    else errors.push(paths[index] + ': processing failed')
-  })
-  return { completed, errors }
+export async function listenForProcessingStages(onStage) {
+  if (!isTauriRuntime()) return () => {}
+  const { listen } = await import('@tauri-apps/api/event')
+  return listen('vocrep://processing-stage', (event) => onStage(event.payload))
 }
 
+export async function processNativeTrack(path, options, jobId) {
+  if (!isTauriRuntime()) throw new Error('Audio processing requires the desktop app')
+  if (!path) throw new Error('Import a local audio file first')
+  const { invoke } = await import('@tauri-apps/api/core')
+  return invoke('process_audio_track', { path, options, jobId })
+}
+
+export async function openNativeOutputFolder(folderPath) {
+  if (!isTauriRuntime()) throw new Error('Opening the output folder requires the desktop app')
+  if (!folderPath) throw new Error('No output folder is available')
+  const { invoke } = await import('@tauri-apps/api/core')
+  return invoke('open_output_folder', { folderPath })
+}
 
 export async function checkNativeAudioEngine() {
   if (!isTauriRuntime()) return { ready: false, error: 'Desktop runtime required', missingFilters: [] }
