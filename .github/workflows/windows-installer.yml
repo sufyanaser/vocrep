@@ -28,8 +28,14 @@ jobs:
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: npm run tauri:build
+      - name: Rename installer to V02
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not produced' }
+          Copy-Item $installer.FullName 'src-tauri/target/release/bundle/nsis/NAS VocRep Setup V02.exe' -Force
       - uses: actions/upload-artifact@v4
         with:
-          name: NAS-VocRep-Windows-Installer
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          name: NAS-VocRep-Setup-V02
+          path: src-tauri/target/release/bundle/nsis/NAS VocRep Setup V02.exe
           if-no-files-found: error
