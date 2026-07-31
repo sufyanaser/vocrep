@@ -1,9 +1,9 @@
 name: Validate and Package V03
 
 on:
-  push:
+  pull_request:
     branches:
-      - feat/v03-complete-tools
+      - develop
 
 permissions:
   contents: write
@@ -15,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
@@ -79,11 +80,12 @@ jobs:
           Remove-Item ".github/scripts/apply_v03.py" -Force
           Remove-Item ".github/v03_chunks" -Recurse -Force
           Remove-Item ".github/v03_payload" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item ".github/v03-trigger.txt" -Force -ErrorAction SilentlyContinue
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "feat: complete VocRep tools and release V03"
-          git push origin HEAD:feat/v03-complete-tools
+          git push origin HEAD:${{ github.head_ref }}
 
       - uses: actions/upload-artifact@v4
         with:
