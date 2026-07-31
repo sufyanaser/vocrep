@@ -68,7 +68,10 @@ jobs:
           git checkout -B validated-v03 origin/develop
           foreach ($file in $files) {
             $source = Join-Path $stage $file
-            New-Item (Split-Path $file) -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+            $parent = Split-Path $file
+            if ($parent) {
+              New-Item $parent -ItemType Directory -Force | Out-Null
+            }
             Copy-Item $source $file -Force
           }
 
