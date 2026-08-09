@@ -187,6 +187,7 @@ pub fn parse_loudnorm_stats(stderr: &str) -> Result<LoudnormStats, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, process::Command};
 
     #[test]
     fn builds_requested_cleanup_chain() {
@@ -247,5 +248,95 @@ mod tests {
         assert_eq!(output_codec(24).unwrap(), "pcm_s24le");
         assert_eq!(output_codec(32).unwrap(), "pcm_f32le");
         assert!(validate_sample_rate(96_000).is_ok());
+    }
+
+    #[test]
+    fn ffmpeg_executes_v04_chain_and_two_pass_loudnorm() {
+        let available = Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !available {
+            eprintln!("FFmpeg is unavailable; skipping runtime DSP validation");
+            return;
+        }
+
+        let filters = build_base_filters(&FilterChainConfig {
+            channel_mode: "Keep Stereo",
+            input_channels: 1,
+            de_click_mode: "Light",
+            noise_cleanup_mode: "Light",
+            sub_bass_cut: true,
+            de_harshness: true,
+            enable_micro_fades: true,
+            duration_secs: 2.0,
+        })
+        .unwrap();
+        let source = "sine=frequency=440:sample_rate=48000:duration=2";
+        let first_pass = append_loudnorm_measurement(&filters, -16.0);
+        let measurement = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-nostats",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-af",
+                &first_pass,
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .expect("FFmpeg measurement process should start");
+        assert!(
+            measurement.status.success(),
+            "FFmpeg first pass failed: {}",
+            String::from_utf8_lossy(&measurement.stderr)
+        );
+
+        let stats = parse_loudnorm_stats(&String::from_utf8_lossy(&measurement.stderr))
+            .expect("First pass should return loudnorm JSON");
+        let second_pass = append_loudnorm_second_pass(&filters, -16.0, &stats);
+        let output_path = std::env::temp_dir().join(format!(
+            "vocrep-v04-dsp-runtime-{}.wav",
+            std::process::id()
+        ));
+        let output_path_string = output_path.to_string_lossy().to_string();
+        let processing = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-af",
+                &second_pass,
+                "-ar",
+                "48000",
+                "-c:a",
+                "pcm_s24le",
+                "-y",
+                &output_path_string,
+            ])
+            .output()
+            .expect("FFmpeg processing process should start");
+        assert!(
+            processing.status.success(),
+            "FFmpeg second pass failed: {}",
+            String::from_utf8_lossy(&processing.stderr)
+        );
+
+        let output_size = fs::metadata(&output_path)
+            .expect("Runtime DSP test should produce a WAV file")
+            .len();
+        assert!(output_size > 44, "Runtime DSP WAV should contain audio data");
+        let _ = fs::remove_file(output_path);
     }
 }
