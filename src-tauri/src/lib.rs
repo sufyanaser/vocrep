@@ -13,6 +13,7 @@ use std::{
     process::Command,
 };
 use tauri::Emitter;
+use tauri_plugin_updater::UpdaterExt;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -749,10 +750,47 @@ fn open_output_folder(folder_path: String) -> Result<(), String> {
         .map_err(|error| format!("Unable to open output folder: {error}"))
 }
 
+#[cfg(desktop)]
+async fn install_available_update(app: tauri::AppHandle) -> Result<(), String> {
+    let updater = app
+        .updater()
+        .map_err(|error| format!("Unable to initialize updater: {error}"))?;
+    let Some(update) = updater
+        .check()
+        .await
+        .map_err(|error| format!("Update check failed: {error}"))?
+    else {
+        return Ok(());
+    };
+
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|error| format!("Update installation failed: {error}"))?;
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+
+            #[cfg(all(desktop, not(debug_assertions)))]
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = install_available_update(handle).await {
+                        eprintln!("NAS VocRep updater: {error}");
+                    }
+                });
+            }
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             check_audio_engine,
             probe_audio_files,
