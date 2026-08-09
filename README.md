@@ -81,3 +81,10 @@ Then process representative vocal, bass/kick, acoustic/synth, mono, and stereo s
 
 - [`docs/PRODUCT_FOUNDATION.md`](docs/PRODUCT_FOUNDATION.md)
 - [`docs/NATIVE_SHELL_METADATA.md`](docs/NATIVE_SHELL_METADATA.md)
+
+
+## Updates and releases
+
+V04 introduces the Tauri signed updater path for Windows. Release builds check the repository's `latest.json` feed on startup; when a newer signed version is available, NAS VocRep downloads and installs it and restarts the app. GitHub Actions builds the signed NSIS updater artifact and publishes the release assets automatically, so users do not need to manually download and run a new installer for each version.
+
+The updater signing private key must remain in GitHub Actions secrets. The matching public key is embedded in `src-tauri/tauri.conf.json`.

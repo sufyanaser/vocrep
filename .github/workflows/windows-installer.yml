@@ -2,16 +2,9 @@ name: Windows Installer
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "src-tauri/**"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/windows-installer.yml"
+
+permissions:
+  contents: read
 
 jobs:
   build-windows:
@@ -27,7 +20,11 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml
-      - run: npm run tauri:build
+      - name: Build signed installer
+        run: npm run tauri:build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Prepare versioned installer
         id: package
         shell: pwsh
