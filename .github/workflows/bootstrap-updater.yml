@@ -1,8 +1,8 @@
 name: Bootstrap updater integration
 
 on:
-  push:
-    branches: [feat/v04-auto-updater-release]
+  pull_request:
+    branches: [develop]
     paths:
       - "scripts/bootstrap_updater.py"
       - ".github/workflows/bootstrap-updater.yml"
@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   apply:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
