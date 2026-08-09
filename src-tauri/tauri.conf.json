@@ -45,7 +45,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "__TAURI_UPDATER_PUBLIC_KEY__",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVDMzc5REJENDM3NjdEOTgKUldTWWZYWkR2WjAzN0wvOGpJb3o3TW1ObFI3c1RET01Xblk1T3QxOUdkK0NFaDJXWm1kR2o1VlAK",
       "endpoints": [
         "https://github.com/sufyanaser/vocrep/releases/latest/download/latest.json"
       ],
