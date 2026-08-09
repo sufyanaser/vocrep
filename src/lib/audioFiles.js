@@ -131,6 +131,18 @@ export async function browseNativeAudioFiles() {
   return Array.isArray(selected) ? selected : [selected]
 }
 
+export async function browseNativeOutputFolder() {
+  if (!isTauriRuntime()) return null
+  const { open } = await import('@tauri-apps/plugin-dialog')
+  const selected = await open({
+    multiple: false,
+    directory: true,
+    title: 'Choose NAS VocRep output folder',
+  })
+  if (!selected) return null
+  return Array.isArray(selected) ? selected[0] ?? null : selected
+}
+
 export async function analyzeNativePaths(paths) {
   if (!paths?.length) return { metadata: [], errors: [] }
   const { invoke } = await import('@tauri-apps/api/core')
@@ -152,11 +164,11 @@ export async function listenForProcessingStages(onStage) {
   return listen('vocrep://processing-stage', (event) => onStage(event.payload))
 }
 
-export async function processNativeTrack(path, options, jobId) {
+export async function processNativeTrack(path, options, jobId, outputDirectory = null, namingMode = 'detailed') {
   if (!isTauriRuntime()) throw new Error('Audio processing requires the desktop app')
   if (!path) throw new Error('Import a local audio file first')
   const { invoke } = await import('@tauri-apps/api/core')
-  return invoke('process_audio_track', { path, options, jobId })
+  return invoke('process_audio_track', { path, options, jobId, outputDirectory, namingMode })
 }
 
 export async function openNativeOutputFolder(folderPath) {
