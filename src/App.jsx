@@ -8,6 +8,7 @@ import {
   analyzeBrowserFiles,
   analyzeNativePaths,
   browseNativeAudioFiles,
+  browseNativeOutputFolder,
   checkNativeAudioEngine,
   formatDuration,
   getNativeWaveform,
@@ -17,6 +18,8 @@ import {
   openNativeOutputFolder,
   processNativeTrack,
 } from './lib/audioFiles.js'
+import { SettingsModal } from './SettingsModal.jsx'
+import { loadAppSettings, saveAppSettings } from './appSettings.js'
 
 const DEFAULT_PROCESS_OPTIONS = Object.freeze({
   channelMode: 'Keep Stereo',
@@ -304,7 +307,9 @@ function ProcessingModal({ session, onClose, onOpenFolder }) {
 export function App() {
   const [tracks, setTracks] = useState([])
   const [selectedId, setSelectedId] = useState(null)
-  const [defaultOptions, setDefaultOptions] = useState(() => cloneOptions())
+  const [appSettings, setAppSettings] = useState(() => loadAppSettings())
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [defaultOptions, setDefaultOptions] = useState(() => cloneOptions({ sampleRate: appSettings.defaultSampleRate, outputDepth: appSettings.defaultOutputDepth }))
   const [settingsScope, setSettingsScope] = useState('all')
   const [playing, setPlaying] = useState(false)
   const [abMode, setAbMode] = useState('A')
@@ -410,6 +415,23 @@ export function App() {
     if (!isTauriRuntime()) return fileInput.current?.click()
     try { await addNativePaths(await browseNativeAudioFiles()) } catch (error) { setNotice(error.message || 'Unable to open audio files') }
   }, [addNativePaths])
+
+  const browseForOutputFolder = useCallback(async () => {
+    if (!isTauriRuntime()) throw new Error('Output folder selection requires the desktop app')
+    return browseNativeOutputFolder()
+  }, [])
+
+  const commitAppSettings = useCallback((nextSettings) => {
+    const normalized = saveAppSettings(nextSettings)
+    setAppSettings(normalized)
+    setDefaultOptions((current) => ({
+      ...current,
+      sampleRate: normalized.defaultSampleRate,
+      outputDepth: normalized.defaultOutputDepth,
+    }))
+    setSettingsOpen(false)
+    setNotice('SETTINGS SAVED')
+  }, [])
 
   const selectTrack = useCallback((id) => {
     if (processing) return
@@ -541,7 +563,7 @@ export function App() {
 
   useEffect(() => {
     const handleKeyDown = (event) => {
-      if (event.code !== 'Space' || event.repeat || processing || processSession) return
+      if (event.code !== 'Space' || event.repeat || processing || processSession || settingsOpen) return
       const target = event.target
       if (target instanceof HTMLElement && (target.matches('input, select, textarea, button, [role="button"]') || target.isContentEditable)) return
       event.preventDefault()
@@ -549,7 +571,7 @@ export function App() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [processSession, processing, togglePlayback])
+  }, [processSession, processing, settingsOpen, togglePlayback])
 
   const changeAbMode = useCallback((mode) => {
     if (mode === 'B' && !selected.outputPath) return setNotice('PROCESS THIS TRACK TO ENABLE B')
@@ -597,7 +619,8 @@ export function App() {
       setTracks((current) => current.map((track) => track.id === target.id ? { ...track, state: 'processing', progress: STAGE_PROGRESS.preparing, error: null } : track))
 
       try {
-        const result = await processNativeTrack(target.path, target.options ?? defaultOptions, jobId)
+        const outputDirectory = appSettings.outputMode === 'custom' && appSettings.outputDirectory.trim() ? appSettings.outputDirectory.trim() : null
+        const result = await processNativeTrack(target.path, target.options ?? defaultOptions, jobId, outputDirectory, appSettings.namingMode)
         completed += 1
         lastOutputFolder = result.outputFolder || lastOutputFolder
         setTracks((current) => current.map((track) => track.id === target.id ? {
@@ -638,6 +661,9 @@ export function App() {
       error: failed ? current?.error ?? `${failed} track${failed === 1 ? '' : 's'} failed` : null,
     }))
     setNotice(`${completed} PROCESSED${failed ? ` · ${failed} FAILED` : ''}`)
+    if (completed && appSettings.openOutputFolderAfterProcess && lastOutputFolder) {
+      try { await openNativeOutputFolder(lastOutputFolder) } catch (error) { setNotice(error.message || 'Unable to open output folder') }
+    }
   }
 
   return (
@@ -692,7 +718,8 @@ export function App() {
           <div className="facts-row"><div><span>FORMAT</span><strong title={activeMetadata.codec}>{activeMetadata.container}</strong></div><div><span>SAMPLE RATE</span><strong>{compactSampleRate(activeMetadata.sampleRateHz)}</strong></div><div><span>BIT DEPTH</span><strong>{activeMetadata.bitDepth ? `${activeMetadata.bitDepth}-bit` : '—'}</strong></div><div><span>CHANNELS</span><strong>{activeMetadata.channelLayout}</strong></div><div><span>TRUE PEAK</span><strong className={activeMetadata.truePeak ? 'peak' : ''}>{activeMetadata.truePeak ?? 'Pending'}</strong></div><div><span>INTEGRATED LUFS</span><strong className={activeMetadata.lufs ? 'lufs' : ''}>{activeMetadata.lufs ?? 'Pending'}</strong></div></div>
           <div className="analysis-row"><div className="analysis-title"><i /> MEASURED ANALYSIS</div><div><span>NOISE FLOOR</span><strong>—</strong></div><div><span>DYNAMIC RANGE</span><strong>—</strong></div><div><span>PEAK LEVEL</span><strong>{activeMetadata.truePeak ?? '—'}</strong></div><div><span>LOUDNESS RANGE</span><strong>—</strong></div><div><span>CREST FACTOR</span><strong>—</strong></div><div><span>CLIPPING</span><strong>—</strong></div></div>
         </section>
-        <footer className="actionbar"><div className="project-info"><GearSix size={25} /><span>ENGINE <strong>{engineStatus.label}</strong></span><span>{tracks.length} TRACKS</span>{importing && <span className="busy-label">IMPORTING</span>}</div>{selected.outputFolder && <button className="folder-button" type="button" onClick={openOutputFolder}><FolderOpen weight="bold" />OUTPUT FOLDER</button>}<button className="process-button secondary" type="button" onClick={() => processTracks(selected?.path ? [selected] : [])} disabled={processing || importing || !tracks.length}><DownloadSimple weight="bold" />PROCESS SELECTED</button><button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={() => processTracks(tracks)} disabled={processing || importing || !tracks.length}><DownloadSimple weight="bold" />{processing ? 'PROCESSING…' : 'PROCESS ALL'}</button></footer>
+        <footer className="actionbar"><div className="project-info"><button className="settings-button" type="button" aria-label="Open settings" title="Settings" disabled={processing || importing} onClick={() => setSettingsOpen(true)}><GearSix size={25} /></button><span>ENGINE <strong>{engineStatus.label}</strong></span><span>{tracks.length} TRACKS</span>{importing && <span className="busy-label">IMPORTING</span>}</div>{selected.outputFolder && <button className="folder-button" type="button" onClick={openOutputFolder}><FolderOpen weight="bold" />OUTPUT FOLDER</button>}<button className="process-button secondary" type="button" onClick={() => processTracks(selected?.path ? [selected] : [])} disabled={processing || importing || !tracks.length}><DownloadSimple weight="bold" />PROCESS SELECTED</button><button className={`process-button ${processing ? 'processing' : ''}`} type="button" onClick={() => processTracks(tracks)} disabled={processing || importing || !tracks.length}><DownloadSimple weight="bold" />{processing ? 'PROCESSING…' : 'PROCESS ALL'}</button></footer>
+        {settingsOpen && <SettingsModal settings={appSettings} engineStatus={engineStatus} desktopRuntime={isTauriRuntime()} onClose={() => setSettingsOpen(false)} onSave={commitAppSettings} onBrowseOutputFolder={browseForOutputFolder} />}
         {processSession && <ProcessingModal session={processSession} onOpenFolder={openOutputFolder} onClose={() => { if (!processing) setProcessSession(null) }} />}
         {notice && <div className="notice" role="status">{notice}</div>}
       </div>

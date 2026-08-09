@@ -500,29 +500,47 @@ fn enhancement_suffix(options: &ProcessOptions) -> String {
     suffix
 }
 
-fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, String> {
+fn output_path_for(
+    input: &Path,
+    options: &ProcessOptions,
+    output_directory: Option<&str>,
+    naming_mode: &str,
+) -> Result<PathBuf, String> {
     let parent = input
         .parent()
         .ok_or_else(|| "Input file has no parent folder".to_string())?;
-    let output_dir = parent.join("CUBASE_READY");
+    let output_dir = match output_directory
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(directory) => PathBuf::from(directory),
+        None => parent.join("CUBASE_READY"),
+    };
     fs::create_dir_all(&output_dir)
-        .map_err(|error| format!("Unable to create CUBASE_READY: {error}"))?;
+        .map_err(|error| format!("Unable to create output folder: {error}"))?;
     let stem = input
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("track");
     let channel = channel_suffix(&options.channel_mode)?;
     let rate = rate_suffix(options.sample_rate);
-    let depth = depth_suffix(options.output_depth);
-    let enhancements = enhancement_suffix(options);
-    Ok(output_dir.join(format!(
-        "{stem}_Ready{channel}{rate}{depth}{enhancements}.wav"
-    )))
+    let file_name = match naming_mode {
+        "compact" => format!("{stem}_Ready{channel}{rate}.wav"),
+        "detailed" | "" => {
+            let depth = depth_suffix(options.output_depth);
+            let enhancements = enhancement_suffix(options);
+            format!("{stem}_Ready{channel}{rate}{depth}{enhancements}.wav")
+        }
+        other => return Err(format!("Unsupported naming mode: {other}")),
+    };
+    Ok(output_dir.join(file_name))
 }
 
 fn prepare_processing(
     path: &str,
     options: &ProcessOptions,
+    output_directory: Option<&str>,
+    naming_mode: &str,
 ) -> Result<(PathBuf, PathBuf, AudioMetadata), String> {
     validate_sample_rate(options.sample_rate)?;
     output_codec(options.output_depth)?;
@@ -539,7 +557,7 @@ fn prepare_processing(
     if normalized_mode(&options.channel_mode) == "rightchannel" && metadata.channels < 2 {
         return Err("Right Channel requires a stereo or multichannel source".to_string());
     }
-    let output = output_path_for(&input, options)?;
+    let output = output_path_for(&input, options, output_directory, naming_mode)?;
     Ok((input, output, metadata))
 }
 
@@ -663,15 +681,18 @@ fn process_audio_track_blocking(
     job_id: String,
     path: String,
     options: ProcessOptions,
+    output_directory: Option<String>,
+    naming_mode: String,
 ) -> Result<ProcessedTrackResult, String> {
     emit_stage(&app, &job_id, "preparing", "active", None);
-    let (input, output, source_metadata) = match prepare_processing(&path, &options) {
-        Ok(value) => value,
-        Err(error) => {
-            emit_stage(&app, &job_id, "preparing", "error", Some(error.clone()));
-            return Err(error);
-        }
-    };
+    let (input, output, source_metadata) =
+        match prepare_processing(&path, &options, output_directory.as_deref(), &naming_mode) {
+            Ok(value) => value,
+            Err(error) => {
+                emit_stage(&app, &job_id, "preparing", "error", Some(error.clone()));
+                return Err(error);
+            }
+        };
     emit_stage(&app, &job_id, "preparing", "done", None);
 
     emit_stage(&app, &job_id, "processing", "active", None);
@@ -723,9 +744,18 @@ async fn process_audio_track(
     job_id: String,
     path: String,
     options: ProcessOptions,
+    output_directory: Option<String>,
+    naming_mode: Option<String>,
 ) -> Result<ProcessedTrackResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        process_audio_track_blocking(app, job_id, path, options)
+        process_audio_track_blocking(
+            app,
+            job_id,
+            path,
+            options,
+            output_directory,
+            naming_mode.unwrap_or_else(|| "detailed".to_string()),
+        )
     })
     .await
     .map_err(|error| format!("Processing task failed: {error}"))?
@@ -845,10 +875,15 @@ mod tests {
 
     #[test]
     fn creates_cubase_ready_output_name() {
-        let output = output_path_for(Path::new("/tmp/Song01 Vocal.wav"), &test_options()).unwrap();
-        assert!(output.ends_with(
-            "CUBASE_READY/Song01 Vocal_Ready_Mono_48k_32f_Sub25_DeHarsh_LUFS16.wav"
-        ));
+        let output = output_path_for(
+            Path::new("/tmp/Song01 Vocal.wav"),
+            &test_options(),
+            None,
+            "detailed",
+        )
+        .unwrap();
+        assert!(output
+            .ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k_32f_Sub25_DeHarsh_LUFS16.wav"));
     }
 
     #[test]
@@ -858,8 +893,21 @@ mod tests {
         options.normalize = false;
         options.sub_bass_cut = false;
         options.de_harshness = false;
-        let output = output_path_for(Path::new("/tmp/Song01.wav"), &options).unwrap();
+        let output =
+            output_path_for(Path::new("/tmp/Song01.wav"), &options, None, "detailed").unwrap();
         assert!(output.ends_with("CUBASE_READY/Song01_Ready_Mono_96k_32f.wav"));
+    }
+
+    #[test]
+    fn creates_compact_output_name() {
+        let output = output_path_for(
+            Path::new("/tmp/Song01 Vocal.wav"),
+            &test_options(),
+            None,
+            "compact",
+        )
+        .unwrap();
+        assert!(output.ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k.wav"));
     }
 
     #[test]
