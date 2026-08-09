@@ -142,6 +142,7 @@ pub fn append_loudnorm_second_pass(
             "measured_LRA={input_lra:.6}:measured_thresh={input_thresh:.6}:",
             "offset={target_offset:.6}:linear=true:print_format=summary"
         ),
+        target_lufs = target_lufs,
         input_i = stats.input_i,
         input_tp = stats.input_tp,
         input_lra = stats.input_lra,
