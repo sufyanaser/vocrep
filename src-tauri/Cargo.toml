@@ -1,6 +1,6 @@
 [package]
 name = "vocrep"
-version = "0.4.0"
+version = "0.4.1"
 description = "Suno track preparation for Cubase"
 authors = ["NAS CodeWorks"]
 edition = "2021"
