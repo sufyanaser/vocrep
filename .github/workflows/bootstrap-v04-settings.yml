@@ -1,0 +1,37 @@
+name: Bootstrap V04 Settings
+
+on:
+  push:
+    branches: [feat/v04-settings-panel]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/v04-settings-panel
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply settings patch
+        run: python scripts/bootstrap_v04_settings.py
+      - name: Format Rust
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit source changes
+        shell: bash
+        run: |
+          if git diff --quiet -- src/App.jsx src/lib/audioFiles.js src-tauri/src/lib.rs; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/App.jsx src/lib/audioFiles.js src-tauri/src/lib.rs
+          git commit -m "feat: activate V04 settings workflow"
+          git push origin HEAD:feat/v04-settings-panel
