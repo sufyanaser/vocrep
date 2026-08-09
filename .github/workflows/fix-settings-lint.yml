@@ -1,0 +1,32 @@
+name: Fix Settings Lint
+
+on:
+  push:
+    branches: [feat/v04-settings-panel]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/v04-settings-panel
+          fetch-depth: 0
+      - name: Apply App settings lint patch
+        run: python scripts/fix_settings_lint.py
+      - name: Commit source change
+        shell: bash
+        run: |
+          if git diff --quiet -- src/App.jsx; then
+            echo "No source changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/App.jsx
+          git commit -m "fix: remount settings modal on open"
+          git push origin HEAD:feat/v04-settings-panel
