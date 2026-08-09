@@ -1,0 +1,68 @@
+name: Release NAS VocRep
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Read release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $config = Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          if ($config.plugins.updater.pubkey -eq '__TAURI_UPDATER_PUBLIC_KEY__') {
+            throw 'Updater public key is not configured. Replace the placeholder before releasing.'
+          }
+          $version = [string]$config.version
+          $parts = $version.Split('.')
+          $label = if ($parts.Length -gt 1) { 'V{0:D2}' -f [int]$parts[1] } else { "v$version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "label=$label" >> $env:GITHUB_OUTPUT
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build signed release and updater feed
+        uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v${{ steps.meta.outputs.version }}
+          releaseName: NAS VocRep ${{ steps.meta.outputs.label }}
+          releaseBody: |
+            NAS VocRep ${{ steps.meta.outputs.label }}
+
+            Windows release with signed in-app updater support.
+            Future releases are discovered through latest.json and installed automatically from inside NAS VocRep.
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          uploadUpdaterSignatures: true
+          releaseAssetNamePattern: NAS-VocRep-[version]-[platform]-[arch][setup][ext]
