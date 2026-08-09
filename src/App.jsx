@@ -21,11 +21,55 @@ import {
 const DEFAULT_PROCESS_OPTIONS = Object.freeze({
   channelMode: 'Keep Stereo',
   normalize: false,
+  targetLufs: -16,
+  subBassCut: false,
+  deHarshness: false,
+  enableMicroFades: false,
   deClickMode: 'Off',
   noiseCleanupMode: 'Off',
   sampleRate: 48000,
   outputDepth: 24,
 })
+
+const FACTORY_PRESETS = Object.freeze([
+  {
+    id: 'vocal-clean',
+    label: 'Vocal Stem Clean',
+    options: Object.freeze({
+      ...DEFAULT_PROCESS_OPTIONS,
+      normalize: true,
+      targetLufs: -16,
+      subBassCut: true,
+      deHarshness: true,
+    }),
+  },
+  {
+    id: 'bass-kick',
+    label: 'Bass / Kick Sub-Fix',
+    options: Object.freeze({
+      ...DEFAULT_PROCESS_OPTIONS,
+      normalize: true,
+      targetLufs: -14,
+      subBassCut: true,
+    }),
+  },
+  {
+    id: 'smooth',
+    label: 'Acoustic & Synth Smooth',
+    options: Object.freeze({
+      ...DEFAULT_PROCESS_OPTIONS,
+      normalize: true,
+      targetLufs: -16,
+      subBassCut: true,
+      deHarshness: true,
+    }),
+  },
+  {
+    id: 'bypass',
+    label: 'Bypass / Raw Conversion',
+    options: DEFAULT_PROCESS_OPTIONS,
+  },
+])
 
 const PROCESS_STAGES = [
   { id: 'preparing', label: 'PREPARING', detail: 'Validating the source and output settings' },
@@ -51,6 +95,10 @@ function cloneOptions(options = DEFAULT_PROCESS_OPTIONS) {
 
 function optionsEqual(left, right) {
   return Object.keys(DEFAULT_PROCESS_OPTIONS).every((key) => left?.[key] === right?.[key])
+}
+
+function presetIdForOptions(options) {
+  return FACTORY_PRESETS.find((preset) => optionsEqual(options, preset.options))?.id ?? 'custom'
 }
 
 function compactSampleRate(value) {
@@ -200,7 +248,7 @@ function ProcessingModal({ session, onClose, onOpenFolder }) {
       <section className={`processing-modal status-${session.status}`} aria-live="polite">
         <header className="processing-header">
           <div>
-            <span className="processing-kicker">NAS VOCREP V03</span>
+            <span className="processing-kicker">NAS VOCREP V04</span>
             <h2 id="processing-title">{title}</h2>
           </div>
           <span className="processing-counter">TRACK {session.trackIndex} / {session.totalTracks}</span>
@@ -273,6 +321,7 @@ export function App() {
   const emptyTrack = useMemo(() => ({ name: 'No track selected', codec: '', container: '—', sampleRateHz: 0, bitDepth: null, channelLayout: '—', truePeak: null, lufs: null, options: defaultOptions }), [defaultOptions])
   const selected = useMemo(() => tracks.find((track) => track.id === selectedId) ?? tracks[0] ?? emptyTrack, [tracks, selectedId, emptyTrack])
   const editingOptions = settingsScope === 'all' ? defaultOptions : selected.options ?? defaultOptions
+  const activePresetId = presetIdForOptions(editingOptions)
   const controlsDisabled = processing || importing || (settingsScope === 'selected' && !selected.id)
   const [previewUrl, setPreviewUrl] = useState('')
   const previewWaveform = abMode === 'B' && selected.outputWaveform ? selected.outputWaveform : selected.waveform
@@ -399,6 +448,11 @@ export function App() {
     if (!selected.id) return
     setTracks((current) => current.map((track) => track.id === selected.id ? { ...track, options: { ...track.options, ...patch } } : track))
   }, [importing, processing, selected.id, settingsScope])
+
+  const applyPreset = useCallback((presetId) => {
+    const preset = FACTORY_PRESETS.find((candidate) => candidate.id === presetId)
+    if (preset) applyOption(cloneOptions(preset.options))
+  }, [applyOption])
 
   useEffect(() => {
     if (!isTauriRuntime()) return undefined
@@ -607,7 +661,7 @@ export function App() {
       />
       <div className="drop-surface" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles(event.dataTransfer.files) }}>
         <input ref={fileInput} className="visually-hidden" type="file" multiple accept="audio/*,.wav,.wave,.flac,.mp3,.m4a,.aac,.ogg,.opus,.aif,.aiff" onChange={(event) => { addFiles(event.target.files); event.target.value = '' }} />
-        <header className="brandbar"><strong>NAS <em>VocRep</em></strong><span>SUNO STEM PREPARATION</span><b>V03</b></header>
+        <header className="brandbar"><strong>NAS <em>VocRep</em></strong><span>SUNO STEM PREPARATION</span><b>V04</b></header>
         <aside className="queue-panel">
           <div className="queue-heading"><div><span>TRACK QUEUE</span><b>{tracks.length}</b></div><div className="queue-actions"><button type="button" onClick={browseForTracks} disabled={importing || processing}><Plus weight="bold" /> ADD TRACKS</button><button className="icon-action" type="button" aria-label="Clear queue" title="Clear queue" onClick={clearQueue} disabled={!tracks.length || processing}><Trash /></button></div></div>
           <div className="track-list">{tracks.length ? tracks.map((track, index) => <TrackRow key={track.id} track={track} index={index} selected={track.id === selectedId} custom={!optionsEqual(track.options, defaultOptions)} disabled={processing} onSelect={() => selectTrack(track.id)} onRemove={() => removeTrack(track.id)} />) : <div className="queue-empty"><Plus /><strong>ADD AUDIO TRACKS</strong><span>Drop multiple files or browse from disk</span><button type="button" onClick={browseForTracks}>BROWSE FILES</button></div>}</div>
@@ -621,12 +675,16 @@ export function App() {
             </div>
           </div>
           <div className="tools-row">
-            <Tool title="Channel Mode" icon={<ArrowsLeftRight />}><select value={editingOptions.channelMode} disabled={controlsDisabled} onChange={(event) => applyOption({ channelMode: event.target.value })} aria-label="Channel mode"><option>Keep Stereo</option><option>Mono Sum</option><option>Left Channel</option><option>Right Channel</option></select></Tool>
-            <Tool title="Normalize" icon={<WaveformIcon />}><Toggle checked={editingOptions.normalize} disabled={controlsDisabled} onChange={(value) => applyOption({ normalize: value })} label="Normalize" /></Tool>
+            <Tool title="Preset" icon={<GearSix />}><select value={activePresetId} disabled={controlsDisabled} onChange={(event) => event.target.value !== 'custom' && applyPreset(event.target.value)} aria-label="Factory preset"><option value="custom">Custom</option>{FACTORY_PRESETS.map((preset) => <option value={preset.id} key={preset.id}>{preset.label}</option>)}</select></Tool>
+            <Tool title="Channel" icon={<ArrowsLeftRight />}><select value={editingOptions.channelMode} disabled={controlsDisabled} onChange={(event) => applyOption({ channelMode: event.target.value })} aria-label="Channel mode"><option>Keep Stereo</option><option>Mono Sum</option><option>Left Channel</option><option>Right Channel</option></select></Tool>
+            <Tool title="Subsonic 25 Hz" icon={<SpeakerSimpleHigh />}><Toggle checked={editingOptions.subBassCut} disabled={controlsDisabled} onChange={(value) => applyOption({ subBassCut: value })} label="Subsonic 25 Hz cut" /></Tool>
+            <Tool title="De-Harsh 12 kHz" icon={<WaveformIcon />}><Toggle checked={editingOptions.deHarshness} disabled={controlsDisabled} onChange={(value) => applyOption({ deHarshness: value })} label="De-Harsh 12 kHz" /></Tool>
+            <Tool title="Micro Fades" icon={<Wrench />}><Toggle checked={editingOptions.enableMicroFades} disabled={controlsDisabled} onChange={(value) => applyOption({ enableMicroFades: value })} label="5 millisecond micro fades" /></Tool>
+            <Tool title="Loudness" icon={<WaveformIcon />}><select value={editingOptions.normalize ? String(editingOptions.targetLufs ?? -16) : 'off'} disabled={controlsDisabled} onChange={(event) => applyOption(event.target.value === 'off' ? { normalize: false } : { normalize: true, targetLufs: Number(event.target.value) })} aria-label="Target loudness"><option value="off">Off</option><option value="-14">-14 LUFS</option><option value="-16">-16 LUFS</option><option value="-18">-18 LUFS</option></select></Tool>
             <Tool title="De-Click" icon={<Wrench />}><select value={editingOptions.deClickMode} disabled={controlsDisabled} onChange={(event) => applyOption({ deClickMode: event.target.value })} aria-label="De-Click"><option>Off</option><option>Light</option><option>Balanced</option><option>Strong</option></select></Tool>
             <Tool title="Noise Cleanup" icon={<WaveformIcon />}><select value={editingOptions.noiseCleanupMode} disabled={controlsDisabled} onChange={(event) => applyOption({ noiseCleanupMode: event.target.value })} aria-label="Noise Cleanup"><option>Off</option><option>Light</option><option>Balanced</option><option>Strong</option></select></Tool>
-            <Tool title="Sample Rate" icon={<SpeakerSimpleHigh />}><select value={editingOptions.sampleRate} disabled={controlsDisabled} onChange={(event) => applyOption({ sampleRate: Number(event.target.value) })} aria-label="Sample rate"><option value={44100}>44.1 kHz</option><option value={48000}>48 kHz</option></select></Tool>
-            <Tool title="Output Depth" icon={<GearSix />}><select value={editingOptions.outputDepth} disabled={controlsDisabled} onChange={(event) => applyOption({ outputDepth: Number(event.target.value) })} aria-label="Output depth"><option value={24}>24-bit PCM</option><option value={32}>32-bit Float</option></select></Tool>
+            <Tool title="Sample Rate" icon={<SpeakerSimpleHigh />}><select value={editingOptions.sampleRate} disabled={controlsDisabled} onChange={(event) => applyOption({ sampleRate: Number(event.target.value) })} aria-label="Sample rate"><option value={44100}>44.1 kHz</option><option value={48000}>48 kHz</option><option value={96000}>96 kHz</option></select></Tool>
+            <Tool title="Output Depth" icon={<GearSix />}><select value={editingOptions.outputDepth} disabled={controlsDisabled} onChange={(event) => applyOption({ outputDepth: Number(event.target.value) })} aria-label="Output depth"><option value={16}>16-bit PCM</option><option value={24}>24-bit PCM</option><option value={32}>32-bit Float</option></select></Tool>
           </div>
           {selected.error && <div className="selected-error"><X weight="bold" /><span>{selected.error}</span></div>}
           <div className="waveform-area"><div className="timeline">{timelineLabels.map((label, index) => <span key={`${label}-${index}`}>{label}</span>)}</div><Waveform playing={playing} position={position} peaks={previewWaveform} channels={previewChannels} onSeek={(ratio) => { const audio = audioRef.current; if (audio?.duration) audio.currentTime = ratio * audio.duration }} /><div className="db-scale"><span>0</span><span>-6</span><span>-12</span><span>-18</span><span>-24</span><span>-∞</span></div></div>
