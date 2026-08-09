@@ -17,26 +17,17 @@ function Switch({ checked, onChange, label }) {
   )
 }
 
-export function SettingsModal({ open, settings, engineStatus, desktopRuntime, onClose, onSave, onBrowseOutputFolder }) {
+export function SettingsModal({ settings, engineStatus, desktopRuntime, onClose, onSave, onBrowseOutputFolder }) {
   const [draft, setDraft] = useState(() => normalizeAppSettings(settings))
   const [browseError, setBrowseError] = useState('')
 
   useEffect(() => {
-    if (!open) return
-    setDraft(normalizeAppSettings(settings))
-    setBrowseError('')
-  }, [open, settings])
-
-  useEffect(() => {
-    if (!open) return undefined
     const onKeyDown = (event) => {
       if (event.key === 'Escape') onClose()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [open, onClose])
-
-  if (!open) return null
+  }, [onClose])
 
   const update = (patch) => setDraft((current) => ({ ...current, ...patch }))
   const chooseOutputFolder = async () => {
