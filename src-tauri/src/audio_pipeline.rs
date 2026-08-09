@@ -86,12 +86,17 @@ pub fn build_base_filters(config: &FilterChainConfig<'_>) -> Result<Vec<String>,
             }
             filters.push("pan=mono|c0=c1".to_string());
         }
-        "keepstereo" | "monosum" => {}
+        "monosum" => {
+            if config.input_channels > 1 {
+                filters.push("pan=mono|c0=0.5*c0+0.5*c1".to_string());
+            }
+        }
+        "keepstereo" => {}
         _ => return Err("Unsupported channel mode".to_string()),
     }
 
     if config.sub_bass_cut {
-        // A 25 Hz Butterworth high-pass also removes DC without applying a no-op dcshift.
+        // A 25 Hz Butterworth high-pass also rejects DC without applying a no-op dcshift.
         filters.push("highpass=f=25:p=2:t=q:w=0.707".to_string());
     }
 
@@ -137,6 +142,7 @@ pub fn append_loudnorm_second_pass(
             "measured_LRA={input_lra:.6}:measured_thresh={input_thresh:.6}:",
             "offset={target_offset:.6}:linear=true:print_format=summary"
         ),
+        target_lufs = target_lufs,
         input_i = stats.input_i,
         input_tp = stats.input_tp,
         input_lra = stats.input_lra,
@@ -201,6 +207,22 @@ mod tests {
         assert!(filters.iter().any(|value| value.starts_with("highshelf=")));
         assert!(filters.iter().any(|value| value.starts_with("afade=t=in")));
         assert!(filters.iter().any(|value| value.contains("st=9.995000")));
+    }
+
+    #[test]
+    fn mono_sum_is_in_filter_graph_for_measurement_accuracy() {
+        let filters = build_base_filters(&FilterChainConfig {
+            channel_mode: "Mono Sum",
+            input_channels: 2,
+            de_click_mode: "Off",
+            noise_cleanup_mode: "Off",
+            sub_bass_cut: false,
+            de_harshness: false,
+            enable_micro_fades: false,
+            duration_secs: 1.0,
+        })
+        .unwrap();
+        assert_eq!(filters.first().unwrap(), "pan=mono|c0=0.5*c0+0.5*c1");
     }
 
     #[test]

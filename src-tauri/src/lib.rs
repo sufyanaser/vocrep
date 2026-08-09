@@ -1,3 +1,10 @@
+mod audio_pipeline;
+
+use audio_pipeline::{
+    append_loudnorm_measurement, append_loudnorm_second_pass, build_base_filters, channel_suffix,
+    de_click_filter, noise_cleanup_filter, normalized_mode, output_codec, parse_loudnorm_stats,
+    validate_sample_rate, FilterChainConfig, LoudnormStats,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -92,7 +99,16 @@ fn check_audio_engine() -> AudioEngineStatus {
         }
     };
 
-    let required = ["adeclick", "afftdn", "loudnorm", "pan"];
+    let required = [
+        "adeclick",
+        "afftdn",
+        "afade",
+        "aresample",
+        "highpass",
+        "highshelf",
+        "loudnorm",
+        "pan",
+    ];
     let missing_filters = required
         .iter()
         .filter(|name| !filters.contains(*name))
@@ -293,14 +309,35 @@ fn probe_audio_files(paths: Vec<String>) -> Vec<Result<AudioMetadata, String>> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct ProcessOptions {
     pub channel_mode: String,
     pub normalize: bool,
+    pub target_lufs: Option<f64>,
+    pub sub_bass_cut: bool,
+    pub de_harshness: bool,
+    pub enable_micro_fades: bool,
     pub de_click_mode: String,
     pub noise_cleanup_mode: String,
     pub sample_rate: u32,
     pub output_depth: u32,
+}
+
+impl Default for ProcessOptions {
+    fn default() -> Self {
+        Self {
+            channel_mode: "Keep Stereo".to_string(),
+            normalize: false,
+            target_lufs: Some(-16.0),
+            sub_bass_cut: false,
+            de_harshness: false,
+            enable_micro_fades: false,
+            de_click_mode: "Off".to_string(),
+            noise_cleanup_mode: "Off".to_string(),
+            sample_rate: 48_000,
+            output_depth: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,50 +454,49 @@ fn get_audio_waveform(path: String, points: usize) -> Result<WaveformData, Strin
     extract_waveform(&path, points.clamp(128, 2048))
 }
 
-fn normalized_mode(mode: &str) -> String {
-    mode.trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| !matches!(character, ' ' | '-'))
-        .collect()
+fn validate_target_lufs(target_lufs: Option<f64>) -> Result<(), String> {
+    if let Some(value) = target_lufs {
+        if !value.is_finite() || !(-70.0..=-5.0).contains(&value) {
+            return Err("Target LUFS must be between -70 and -5".to_string());
+        }
+    }
+    Ok(())
 }
 
-fn channel_suffix(mode: &str) -> Result<&'static str, String> {
-    match normalized_mode(mode).as_str() {
-        "keepstereo" => Ok(""),
-        "monosum" => Ok("_Mono"),
-        "leftchannel" => Ok("_Left"),
-        "rightchannel" => Ok("_Right"),
-        _ => Err("Channel mode must be Keep Stereo, Mono Sum, Left Channel, or Right Channel".to_string()),
+fn rate_suffix(sample_rate: u32) -> &'static str {
+    match sample_rate {
+        44_100 => "_44k",
+        48_000 => "_48k",
+        96_000 => "_96k",
+        _ => "",
     }
 }
 
-fn de_click_filter(mode: &str) -> Result<Option<&'static str>, String> {
-    match normalized_mode(mode).as_str() {
-        "off" => Ok(None),
-        "light" => Ok(Some("adeclick=w=40:o=70:a=2:t=2")),
-        "balanced" => Ok(Some("adeclick=w=55:o=75:a=2:t=2")),
-        "strong" => Ok(Some("adeclick=w=70:o=80:a=2:t=2")),
-        _ => Err("De-Click mode must be Off, Light, Balanced, or Strong".to_string()),
-    }
-}
-
-fn noise_cleanup_filter(mode: &str) -> Result<Option<&'static str>, String> {
-    match normalized_mode(mode).as_str() {
-        "off" => Ok(None),
-        "light" => Ok(Some("afftdn=nf=-38:nr=5:tn=1")),
-        "balanced" => Ok(Some("afftdn=nf=-34:nr=9:tn=1")),
-        "strong" => Ok(Some("afftdn=nf=-30:nr=14:tn=1")),
-        _ => Err("Noise Cleanup mode must be Off, Light, Balanced, or Strong".to_string()),
-    }
-}
-
-fn output_codec(depth: u32) -> Result<&'static str, String> {
+fn depth_suffix(depth: u32) -> &'static str {
     match depth {
-        24 => Ok("pcm_s24le"),
-        32 => Ok("pcm_f32le"),
-        _ => Err("Output depth must be 24 or 32".to_string()),
+        16 => "_16b",
+        24 => "_24b",
+        32 => "_32f",
+        _ => "",
     }
+}
+
+fn enhancement_suffix(options: &ProcessOptions) -> String {
+    let mut suffix = String::new();
+    if options.sub_bass_cut {
+        suffix.push_str("_Sub25");
+    }
+    if options.de_harshness {
+        suffix.push_str("_DeHarsh");
+    }
+    if options.enable_micro_fades {
+        suffix.push_str("_Fade5ms");
+    }
+    if options.normalize {
+        let target = options.target_lufs.unwrap_or(-16.0).abs();
+        suffix.push_str(&format!("_LUFS{target:.0}"));
+    }
+    suffix
 }
 
 fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, String> {
@@ -475,19 +511,24 @@ fn output_path_for(input: &Path, options: &ProcessOptions) -> Result<PathBuf, St
         .and_then(|value| value.to_str())
         .unwrap_or("track");
     let channel = channel_suffix(&options.channel_mode)?;
-    let rate = if options.sample_rate == 44_100 { "_44k" } else { "_48k" };
-    let depth = if options.output_depth == 32 { "_32f" } else { "_24b" };
-    Ok(output_dir.join(format!("{stem}_Ready{channel}{rate}{depth}.wav")))
+    let rate = rate_suffix(options.sample_rate);
+    let depth = depth_suffix(options.output_depth);
+    let enhancements = enhancement_suffix(options);
+    Ok(output_dir.join(format!(
+        "{stem}_Ready{channel}{rate}{depth}{enhancements}.wav"
+    )))
 }
 
-fn prepare_processing(path: &str, options: &ProcessOptions) -> Result<(PathBuf, PathBuf, u32), String> {
-    if options.sample_rate != 44_100 && options.sample_rate != 48_000 {
-        return Err("Sample rate must be 44100 or 48000".to_string());
-    }
+fn prepare_processing(
+    path: &str,
+    options: &ProcessOptions,
+) -> Result<(PathBuf, PathBuf, AudioMetadata), String> {
+    validate_sample_rate(options.sample_rate)?;
     output_codec(options.output_depth)?;
     channel_suffix(&options.channel_mode)?;
     de_click_filter(&options.de_click_mode)?;
     noise_cleanup_filter(&options.noise_cleanup_mode)?;
+    validate_target_lufs(options.target_lufs)?;
 
     let input = PathBuf::from(path);
     if !input.is_file() {
@@ -498,17 +539,86 @@ fn prepare_processing(path: &str, options: &ProcessOptions) -> Result<(PathBuf, 
         return Err("Right Channel requires a stereo or multichannel source".to_string());
     }
     let output = output_path_for(&input, options)?;
-    Ok((input, output, metadata.channels))
+    Ok((input, output, metadata))
+}
+
+fn processing_filters(
+    options: &ProcessOptions,
+    input_channels: u32,
+    duration_secs: f64,
+) -> Result<Vec<String>, String> {
+    build_base_filters(&FilterChainConfig {
+        channel_mode: &options.channel_mode,
+        input_channels,
+        de_click_mode: &options.de_click_mode,
+        noise_cleanup_mode: &options.noise_cleanup_mode,
+        sub_bass_cut: options.sub_bass_cut,
+        de_harshness: options.de_harshness,
+        enable_micro_fades: options.enable_micro_fades,
+        duration_secs,
+    })
+}
+
+fn measure_loudnorm(
+    input: &Path,
+    filters: &[String],
+    sample_rate: u32,
+    target_lufs: f64,
+) -> Result<LoudnormStats, String> {
+    let input_path = input.to_string_lossy();
+    let mut measurement_filters = filters.to_vec();
+    measurement_filters.push(format!("aresample={sample_rate}"));
+    let filter_chain = append_loudnorm_measurement(&measurement_filters, target_lufs);
+
+    let output = hidden_command("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-nostdin",
+            "-nostats",
+            "-i",
+            input_path.as_ref(),
+            "-vn",
+            "-af",
+            &filter_chain,
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|error| format!("Unable to start loudness measurement: {error}"))?;
+
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            "Loudness measurement failed".to_string()
+        } else {
+            message
+        });
+    }
+
+    parse_loudnorm_stats(&String::from_utf8_lossy(&output.stderr))
 }
 
 fn run_processing(
     input: &Path,
     output: &Path,
     options: &ProcessOptions,
-    input_channels: u32,
+    metadata: &AudioMetadata,
 ) -> Result<(), String> {
     let input_path = input.to_string_lossy();
     let output_path = output.to_string_lossy();
+    let base_filters = processing_filters(options, metadata.channels, metadata.duration_seconds)?;
+
+    let final_filter_chain = if options.normalize {
+        let target_lufs = options.target_lufs.unwrap_or(-16.0);
+        let stats = measure_loudnorm(input, &base_filters, options.sample_rate, target_lufs)?;
+        let mut normalized_filters = base_filters.clone();
+        normalized_filters.push(format!("aresample={}", options.sample_rate));
+        append_loudnorm_second_pass(&normalized_filters, target_lufs, &stats)
+    } else {
+        base_filters.join(",")
+    };
+
     let mut command = hidden_command("ffmpeg");
     command.args([
         "-hide_banner",
@@ -521,27 +631,8 @@ fn run_processing(
         "-vn",
     ]);
 
-    let mut filters = Vec::new();
-    match normalized_mode(&options.channel_mode).as_str() {
-        "leftchannel" => filters.push("pan=mono|c0=c0".to_string()),
-        "rightchannel" => filters.push("pan=mono|c0=c1".to_string()),
-        _ => {}
-    }
-    if let Some(filter) = de_click_filter(&options.de_click_mode)? {
-        filters.push(filter.to_string());
-    }
-    if let Some(filter) = noise_cleanup_filter(&options.noise_cleanup_mode)? {
-        filters.push(filter.to_string());
-    }
-    if options.normalize {
-        filters.push("loudnorm=I=-18:TP=-1.0:LRA=11".to_string());
-    }
-    if !filters.is_empty() {
-        command.args(["-af", &filters.join(",")]);
-    }
-
-    if normalized_mode(&options.channel_mode) == "monosum" && input_channels > 1 {
-        command.args(["-ac", "1"]);
+    if !final_filter_chain.is_empty() {
+        command.args(["-af", &final_filter_chain]);
     }
 
     command.args([
@@ -573,7 +664,7 @@ fn process_audio_track_blocking(
     options: ProcessOptions,
 ) -> Result<ProcessedTrackResult, String> {
     emit_stage(&app, &job_id, "preparing", "active", None);
-    let (input, output, input_channels) = match prepare_processing(&path, &options) {
+    let (input, output, source_metadata) = match prepare_processing(&path, &options) {
         Ok(value) => value,
         Err(error) => {
             emit_stage(&app, &job_id, "preparing", "error", Some(error.clone()));
@@ -583,7 +674,7 @@ fn process_audio_track_blocking(
     emit_stage(&app, &job_id, "preparing", "done", None);
 
     emit_stage(&app, &job_id, "processing", "active", None);
-    if let Err(error) = run_processing(&input, &output, &options, input_channels) {
+    if let Err(error) = run_processing(&input, &output, &options, &source_metadata) {
         emit_stage(&app, &job_id, "processing", "error", Some(error.clone()));
         return Err(error);
     }
@@ -681,6 +772,10 @@ mod tests {
         ProcessOptions {
             channel_mode: "Mono Sum".to_string(),
             normalize: true,
+            target_lufs: Some(-16.0),
+            sub_bass_cut: true,
+            de_harshness: true,
+            enable_micro_fades: false,
             de_click_mode: "Balanced".to_string(),
             noise_cleanup_mode: "Light".to_string(),
             sample_rate: 48_000,
@@ -703,24 +798,30 @@ mod tests {
     }
 
     #[test]
-    fn resolves_independent_cleanup_profiles() {
-        assert!(de_click_filter("Off").unwrap().is_none());
-        assert!(de_click_filter("Balanced").unwrap().unwrap().contains("adeclick"));
-        assert!(noise_cleanup_filter("Light").unwrap().unwrap().contains("nr=5"));
-        assert!(noise_cleanup_filter("Strong").unwrap().unwrap().contains("nr=14"));
-    }
-
-    #[test]
     fn resolves_output_codecs() {
+        assert_eq!(output_codec(16).unwrap(), "pcm_s16le");
         assert_eq!(output_codec(24).unwrap(), "pcm_s24le");
         assert_eq!(output_codec(32).unwrap(), "pcm_f32le");
-        assert!(output_codec(16).is_err());
+        assert!(output_codec(20).is_err());
     }
 
     #[test]
     fn creates_cubase_ready_output_name() {
         let output = output_path_for(Path::new("/tmp/Song01 Vocal.wav"), &test_options()).unwrap();
-        assert!(output.ends_with("CUBASE_READY/Song01 Vocal_Ready_Mono_48k_32f.wav"));
+        assert!(output.ends_with(
+            "CUBASE_READY/Song01 Vocal_Ready_Mono_48k_32f_Sub25_DeHarsh_LUFS16.wav"
+        ));
+    }
+
+    #[test]
+    fn supports_96k_output_name() {
+        let mut options = test_options();
+        options.sample_rate = 96_000;
+        options.normalize = false;
+        options.sub_bass_cut = false;
+        options.de_harshness = false;
+        let output = output_path_for(Path::new("/tmp/Song01.wav"), &options).unwrap();
+        assert!(output.ends_with("CUBASE_READY/Song01_Ready_Mono_96k_32f.wav"));
     }
 
     #[test]
