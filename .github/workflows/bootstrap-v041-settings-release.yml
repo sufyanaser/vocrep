@@ -1,0 +1,52 @@
+name: Bootstrap V04.1 Settings Release
+
+on:
+  push:
+    branches: [release/v0.4.1-settings]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v0.4.1-settings
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Align V04.1 versions
+        shell: bash
+        run: |
+          npm version 0.4.1 --no-git-tag-version
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          cargo = Path('src-tauri/Cargo.toml')
+          text = cargo.read_text(encoding='utf-8')
+          old = 'version = "0.4.0"'
+          if text.count(old) < 1:
+              raise SystemExit('Cargo package version 0.4.0 not found')
+          text = text.replace(old, 'version = "0.4.1"', 1)
+          cargo.write_text(text, encoding='utf-8')
+
+          config_path = Path('src-tauri/tauri.conf.json')
+          config = json.loads(config_path.read_text(encoding='utf-8'))
+          if config.get('version') != '0.4.0':
+              raise SystemExit(f"Unexpected Tauri version: {config.get('version')}")
+          config['version'] = '0.4.1'
+          config_path.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
+          PY
+      - name: Commit release metadata
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json src-tauri/Cargo.toml src-tauri/tauri.conf.json
+          git commit -m "release: bump NAS VocRep to 0.4.1"
+          git push origin HEAD:release/v0.4.1-settings
