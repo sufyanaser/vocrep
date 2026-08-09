@@ -17,17 +17,30 @@ function Switch({ checked, onChange, label }) {
   )
 }
 
-export function SettingsModal({ settings, engineStatus, desktopRuntime, onClose, onSave, onBrowseOutputFolder }) {
+export function SettingsModal({ open, settings, engineStatus, desktopRuntime, onClose, onSave, onBrowseOutputFolder }) {
   const [draft, setDraft] = useState(() => normalizeAppSettings(settings))
   const [browseError, setBrowseError] = useState('')
 
+  const closeWithoutSaving = () => {
+    setDraft(normalizeAppSettings(settings))
+    setBrowseError('')
+    onClose()
+  }
+
   useEffect(() => {
+    if (!open) return undefined
     const onKeyDown = (event) => {
-      if (event.key === 'Escape') onClose()
+      if (event.key === 'Escape') {
+        setDraft(normalizeAppSettings(settings))
+        setBrowseError('')
+        onClose()
+      }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onClose])
+  }, [open, onClose, settings])
+
+  if (!open) return null
 
   const update = (patch) => setDraft((current) => ({ ...current, ...patch }))
   const chooseOutputFolder = async () => {
@@ -43,14 +56,14 @@ export function SettingsModal({ settings, engineStatus, desktopRuntime, onClose,
   const customOutputInvalid = draft.outputMode === 'custom' && !draft.outputDirectory.trim()
 
   return (
-    <div className="settings-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+    <div className="settings-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeWithoutSaving() }}>
       <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header className="settings-header">
           <div>
             <span>NAS VOCREP V04</span>
             <h2 id="settings-title"><GearSix weight="bold" /> SETTINGS</h2>
           </div>
-          <button type="button" className="settings-close" aria-label="Close settings" onClick={onClose}><X weight="bold" /></button>
+          <button type="button" className="settings-close" aria-label="Close settings" onClick={closeWithoutSaving}><X weight="bold" /></button>
         </header>
 
         <div className="settings-body">
@@ -119,7 +132,7 @@ export function SettingsModal({ settings, engineStatus, desktopRuntime, onClose,
         <footer className="settings-actions">
           <button type="button" className="settings-reset" onClick={() => setDraft({ ...DEFAULT_APP_SETTINGS })}>RESET DEFAULTS</button>
           <span />
-          <button type="button" className="settings-cancel" onClick={onClose}>CANCEL</button>
+          <button type="button" className="settings-cancel" onClick={closeWithoutSaving}>CANCEL</button>
           <button type="button" className="settings-save" disabled={customOutputInvalid} onClick={() => onSave(draft)}>SAVE SETTINGS</button>
         </footer>
       </section>
